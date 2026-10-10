@@ -1,16 +1,14 @@
 services:
   - type: web
     name: lityra-hire-api
-    runtime: docker
-    dockerfilePath: ./deployment/Dockerfile
-    dockerContext: .
+    runtime: python
+    buildCommand: python -m pip install -r backend/requirements.txt && python -m pip install ./backend/libs supervisor==4.2.5
+    startCommand: bash deployment/entrypoint.sh
     plan: standard
     healthCheckPath: /health
     envVars:
       - key: APP_PRODUCT
         value: hire
-      - key: SERVICE_REGISTRY_PATH
-        value: /app/backend/services.txt
       - key: SKIP_INIT
         value: "1"
       - key: PORT
@@ -23,6 +21,8 @@ services:
         value: "15"
       - key: APP_ENV
         value: production
+      - key: PYTHON_VERSION
+        value: "3.11.11"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET

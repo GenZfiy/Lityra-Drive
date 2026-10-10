@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# LARE backend entrypoint. Reads backend/services.txt (the single source of
-# truth for name/dir/port), initialises each service's schema, writes a
-# supervisord program per service, then runs them all — the container twin of
-# run-all.ps1. Env (DATABASE_URL, JWT secrets, API keys, REDIS_URL) is supplied
-# by docker-compose's env_file and inherited by every child process.
+# Native Render entrypoint for the standalone Lityra Hire backend. Reads the
+# product service registry and starts each service under supervisord. Runtime
+# secrets are supplied by Render and inherited by every child process.
 set -euo pipefail
 
-ROOT=/app/backend
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${BACKEND_ROOT:-$PROJECT_ROOT/backend}"
 if [[ -n "${SERVICE_REGISTRY_PATH:-}" ]]; then
   REGISTRY="$SERVICE_REGISTRY_PATH"
+  if [[ "$REGISTRY" != /* ]]; then REGISTRY="$PROJECT_ROOT/$REGISTRY"; fi
 else
-  case "${APP_PRODUCT:-combined}" in
-    learn|hire) REGISTRY="$ROOT/services.${APP_PRODUCT}.txt" ;;
-    combined) REGISTRY="$ROOT/services.txt" ;;
-    *) echo "[entrypoint] ERROR: invalid APP_PRODUCT" >&2; exit 2 ;;
-  esac
+  REGISTRY="$ROOT/services.txt"
 fi
-# Write to the default path so `supervisorctl` (no -c) finds the socket too.
-CONF=/etc/supervisor/supervisord.conf
+RUN_DIR="${SUPERVISOR_RUN_DIR:-${TMPDIR:-/tmp}/lityra-${APP_PRODUCT:-app}}"
+CONF="${SUPERVISOR_CONFIG:-$RUN_DIR/supervisord.conf}"
+SOCKET="$RUN_DIR/supervisor.sock"
+mkdir -p "$RUN_DIR"
 
 # Postgres/Supabase reserve these schema names, so run-all.ps1 prefixes them
 # with "lare_". Mirror that exactly (only "auth" collides in our registry).
@@ -65,22 +63,22 @@ else
 fi
 
 # ---- 2. generate one supervisord [program] per service -----------------------
-mkdir -p /etc/supervisor /var/log/lare
-cat > "$CONF" <<'HEADER'
+cat > "$CONF" <<HEADER
 [supervisord]
 nodaemon=true
 logfile=/dev/null
 logfile_maxbytes=0
+pidfile=$RUN_DIR/supervisord.pid
 
 [unix_http_server]
-file=/var/run/supervisor.sock
+file=$SOCKET
 chmod=0700
 
 [rpcinterface:supervisor]
 supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 
 [supervisorctl]
-serverurl=unix:///var/run/supervisor.sock
+serverurl=unix://$SOCKET
 HEADER
 
 while read -r name dir port; do
