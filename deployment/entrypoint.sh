@@ -3,6 +3,7 @@
 # product service registry and starts each service under supervisord. Runtime
 # secrets are supplied by Render and inherited by every child process.
 set -euo pipefail
+umask 077
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${BACKEND_ROOT:-$PROJECT_ROOT/backend}"
@@ -23,6 +24,8 @@ fi
 RUN_DIR="${SUPERVISOR_RUN_DIR:-${TMPDIR:-/tmp}/lityra-${APP_PRODUCT:-app}}"
 CONF="${SUPERVISOR_CONFIG:-$RUN_DIR/supervisord.conf}"
 SOCKET="$RUN_DIR/supervisor.sock"
+CONTROL_USER="${SUPERVISOR_CONTROL_USER:-render-local}"
+CONTROL_PASSWORD="${SUPERVISOR_CONTROL_PASSWORD:-$(python -c 'import secrets; print(secrets.token_urlsafe(32))')}"
 mkdir -p "$RUN_DIR"
 
 # Postgres/Supabase reserve these schema names, so run-all.ps1 prefixes them
@@ -81,6 +84,8 @@ pidfile=$RUN_DIR/supervisord.pid
 [unix_http_server]
 file=$SOCKET
 chmod=0700
+username=$CONTROL_USER
+password=$CONTROL_PASSWORD
 
 [rpcinterface:supervisor]
 supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
