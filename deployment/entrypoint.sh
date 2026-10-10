@@ -12,6 +12,14 @@ if [[ -n "${SERVICE_REGISTRY_PATH:-}" ]]; then
 else
   REGISTRY="$ROOT/services.txt"
 fi
+if [[ ! -f "$REGISTRY" ]]; then
+  echo "[entrypoint] WARNING: service registry not found at $REGISTRY; using $ROOT/services.txt" >&2
+  REGISTRY="$ROOT/services.txt"
+fi
+if [[ ! -f "$REGISTRY" ]]; then
+  echo "[entrypoint] ERROR: service registry not found at $REGISTRY" >&2
+  exit 1
+fi
 RUN_DIR="${SUPERVISOR_RUN_DIR:-${TMPDIR:-/tmp}/lityra-${APP_PRODUCT:-app}}"
 CONF="${SUPERVISOR_CONFIG:-$RUN_DIR/supervisord.conf}"
 SOCKET="$RUN_DIR/supervisor.sock"

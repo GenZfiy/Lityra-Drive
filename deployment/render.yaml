@@ -2,7 +2,7 @@ services:
   - type: web
     name: lityra-hire-api
     runtime: python
-    buildCommand: python -m pip install -r backend/requirements.txt && python -m pip install ./backend/libs supervisor==4.2.5
+    buildCommand: python -m pip install "setuptools<81" && python -m pip install -r backend/requirements.txt && python -m pip install ./backend/libs supervisor==4.2.5
     startCommand: bash deployment/entrypoint.sh
     plan: standard
     healthCheckPath: /health
