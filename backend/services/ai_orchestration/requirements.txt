@@ -1,0 +1,5 @@
+# AI Orchestration provider SDKs (optional — enable LIVE responses).
+# Without the SDK for the selected AI_PROVIDER the service falls back to
+# deterministic STUB mode.
+anthropic>=0.40.0          # AI_PROVIDER=anthropic
+google-genai>=1.0.0        # AI_PROVIDER=gemini  (import: from google import genai)

@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: lityra-hire-api
+    runtime: docker
+    dockerfilePath: ./deployment/Dockerfile
+    dockerContext: .
+    plan: standard
+    healthCheckPath: /health
+    envVars:
+      - key: APP_PRODUCT
+        value: hire
+      - key: SERVICE_REGISTRY_PATH
+        value: /app/backend/services.txt
+      - key: SKIP_INIT
+        value: "1"
+      - key: PORT
+        value: "10000"
+      - key: DB_POOL_SIZE
+        value: "1"
+      - key: DB_MAX_OVERFLOW
+        value: "0"
+      - key: DB_POOL_TIMEOUT
+        value: "15"
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: INTERNAL_JWT_SECRET
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: AUTH_ALLOWED_PRODUCT
+        value: hire
+      - key: JWT_ISSUER
+        value: lityra-hire-auth
+      - key: JWT_AUDIENCE
+        value: lityra-hire-api

@@ -1,0 +1,24 @@
+# Lityra Hire runtime registry
+auth auth 8001
+candidate candidate 8010
+drive drive 8011
+questionbank questionbank 8012
+exam exam 8013
+submission submission 8014
+anticheat anticheat 8015
+coding coding 8016
+evaluation evaluation 8017
+interview interview 8018
+result result 8019
+notification notification 8020
+files files 8021
+analytics analytics 8022
+audit audit 8023
+ai_orchestration ai_orchestration 8024
+organization organization 8026
+evidence evidence 8027
+competency competency 8028
+decision decision 8029
+action action 8030
+recruit_ai recruit_ai 8031
+gateway gateway 8000

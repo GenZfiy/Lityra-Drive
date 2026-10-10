@@ -1,0 +1,16 @@
+services:
+  lityra-hire-api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      APP_PRODUCT: hire
+      AUTH_ALLOWED_PRODUCT: hire
+      SERVICE_REGISTRY_PATH: /app/backend/services.txt
+      SKIP_INIT: "1"
+      PORT: "10000"
+      HOST: 0.0.0.0
+    ports:
+      - "8000:10000"
