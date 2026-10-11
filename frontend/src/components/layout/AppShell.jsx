@@ -10,6 +10,7 @@ import {
   BarChart3,
   Code2,
   Building2,
+  CalendarClock,
   FileStack,
   Award,
   Sparkles,
@@ -44,6 +45,7 @@ import { api } from "../../lib/api.js";
 const CareerConstellation = lazy(() => import("../ui/CareerConstellation.jsx").then((module) => ({ default: module.CareerConstellation })));
 
 const RECRUITER_ROLES = ["recruiter", "company_admin", "super_admin"];
+const DRIVE_MANAGER_ROLES = [...RECRUITER_ROLES, "tpo", "college_admin", "principal"];
 const STAFF_ROLES = ["super_admin", "company_admin", "college_admin", "trainer"];
 const PLATFORM_ADMIN = ["super_admin", "company_admin"];
 const ANALYTICS_ROLES = ["super_admin", "company_admin", "college_admin",
@@ -51,6 +53,13 @@ const ANALYTICS_ROLES = ["super_admin", "company_admin", "college_admin",
 const CONTENT_AUTHOR_ROLES = ["super_admin", "company_admin", "college_admin", "trainer", "faculty", "hod"];
 const TRAINING_CENTER_ROLES = ["super_admin", "company_admin", "college_admin", "principal", "dean", "hod", "trainer", "faculty"];
 const STUDENT = ["student"];
+
+function canSeeItem(item, roles, permissions, scopeLevel) {
+  const roleMatch = !item.roles || roles.some((role) => item.roles.includes(role));
+  const permissionMatch = !item.permissions || item.permissions.some((permission) => permissions.includes(permission));
+  const scopeMatch = !item.scopes || item.scopes.includes(scopeLevel);
+  return roleMatch && permissionMatch && scopeMatch;
+}
 
 // Two standalone apps on one platform. Each product owns its own nav; they never
 // appear together. Every item declares which roles may see it — students see only
@@ -126,11 +135,32 @@ export const PRODUCTS = {
     sections: [
       {
         title: "Recruiter",
-        roles: RECRUITER_ROLES,
+        roles: DRIVE_MANAGER_ROLES,
         items: [
-          { to: "/drive/recruiter/drives", icon: Building2, label: "Manage Drives" },
-          { to: "/drive/recruiter/access-codes", icon: KeyRound, label: "Drive Access IDs" },
-          { to: "/drive/recruiter/questions", icon: FileStack, label: "Question Bank" },
+          { to: "/drive/recruiter/drives", icon: Building2, label: "Manage Drives", permissions: ["drive.drive.manage", "drive.drive.view"] },
+          { to: "/drive/recruiter/access-codes", icon: KeyRound, label: "Drive Access IDs", permissions: ["drive.access.manage"] },
+          { to: "/drive/recruiter/questions", icon: FileStack, label: "Question Bank", permissions: ["drive.question.manage", "drive.question.review"] },
+        ],
+      },
+      {
+        title: "Administration",
+        roles: [...new Set([...RECRUITER_ROLES, ...STAFF_ROLES, "principal", "dean", "hod", "tpo", "faculty", "training_center_admin", "program_manager", "interviewer"])],
+        items: [
+          { to: "/drive/admin/training-centers", icon: Building2, label: "Training Centers", permissions: ["training.center.view", "training.center.manage"] },
+          { to: "/drive/admin/institution-analytics", icon: BarChart3, label: "Institution Analytics", permissions: ["analytics.platform.view", "analytics.college.view", "analytics.branch.view", "analytics.section.view"] },
+          { to: "/drive/admin/placement", icon: Briefcase, label: "Placement Readiness", permissions: ["analytics.platform.view", "analytics.college.view"], scopes: ["platform", "college"] },
+          { to: "/drive/admin/institutions", icon: Building2, label: "Institutions", permissions: ["institution.view", "institution.manage"] },
+          { to: "/drive/admin/users", icon: Users, label: "User Management", permissions: ["auth.user.view", "auth.user.manage"] },
+          { to: "/drive/admin/roles", icon: ShieldCheck, label: "Roles & Permissions", permissions: ["auth.role.manage", "auth.role.assign"] },
+          { to: "/drive/admin/audit", icon: ScrollText, label: "Audit Trails", permissions: ["platform.audit.view"] },
+          { to: "/drive/admin/access-ids", icon: KeyRound, label: "Access IDs", permissions: ["drive.access.manage"] },
+        ],
+      },
+      {
+        title: "Interviewer",
+        roles: ["interviewer"],
+        items: [
+          { to: "/drive/interviews", icon: CalendarClock, label: "My Interviews" },
         ],
       },
     ],
@@ -165,6 +195,7 @@ export function AppShell({ children, product = "lms" }) {
   const [hasAssignedTrainingCenter, setHasAssignedTrainingCenter] = useState(false);
   const [theme, setThemeState] = useState(getTheme());
   const roles = user?.roles || [];
+  const permissions = user?.permissions || [];
 
   useEffect(() => {
     if (cfg.key !== "lms") return;
@@ -217,7 +248,7 @@ export function AppShell({ children, product = "lms" }) {
         </div>
 
         <nav aria-label={`${cfg.title} navigation`} className="flex-1 px-3 py-4 space-y-1 overflow-y-auto sidebar-scroll">
-          {visibleItems(cfg.items, roles).map((item) => (
+          {visibleItems(cfg.items, roles).filter((item) => canSeeItem(item, roles, permissions, user?.scope_level)).map((item) => (
             <NavLink key={item.to} to={item.to} end={item.end} onClick={() => setOpen(false)} className={linkClass}>
               <item.icon size={19} strokeWidth={1.75} />
               {item.label}
@@ -225,13 +256,13 @@ export function AppShell({ children, product = "lms" }) {
           ))}
 
           {cfg.sections.map((sec) =>
-            roles.some((r) => sec.roles.includes(r)) ? (
+            roles.some((r) => sec.roles.includes(r)) && visibleItems(sec.items, roles).some((item) => canSeeItem(item, roles, permissions, user?.scope_level) && (item.to !== "/lms/training-centers" || hasAssignedTrainingCenter)) ? (
               <div key={sec.title}>
                 <p className="app-nav-section px-3 pt-5 pb-2 text-[10px] font-semibold uppercase tracking-[.15em] text-slate-500">
                   {sec.title}
                 </p>
                 {sec.items
-                  .filter((item) => !item.roles || roles.some((r) => item.roles.includes(r)))
+                  .filter((item) => canSeeItem(item, roles, permissions, user?.scope_level))
                   .filter((item) => item.to !== "/lms/training-centers" || hasAssignedTrainingCenter)
                   .map((item) => (
                   <NavLink key={item.to} to={item.to} onClick={() => setOpen(false)} className={linkClass}>

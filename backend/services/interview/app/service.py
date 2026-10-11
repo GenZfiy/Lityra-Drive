@@ -75,6 +75,12 @@ class InterviewService:
         ).scalars().all()
         return [self.out(iv) for iv in rows]
 
+    def for_interviewer(self, s: Session, interviewer_id: str) -> list[dict]:
+        rows = s.execute(select(Interview).where(
+            Interview.interviewer_id == interviewer_id
+        ).order_by(Interview.slot)).scalars().all()
+        return [self.out(iv) for iv in rows]
+
     @staticmethod
     def out(iv: Interview) -> dict:
         return {"id": iv.id, "drive_id": iv.drive_id, "candidate_id": iv.candidate_id,

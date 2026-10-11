@@ -5,7 +5,7 @@ from flask import Blueprint, current_app, request
 from pydantic import ValidationError
 
 from lare_common.auth_context import current_identity, require_roles
-from lare_common.errors import BadRequest
+from lare_common.errors import BadRequest, NotFound
 from lare_common.responses import created, ok
 from lare_common.service_client import ServiceClient
 
@@ -54,22 +54,37 @@ def create():
 @bp.get("/org/v1/organizations")
 @require_roles(*ADMIN)
 def list_orgs():
+    ident = current_identity()
     with _db().session() as s:
+        # A company administrator is tenant-scoped even though the role has
+        # platform-level product permissions. Only Super Admin can enumerate
+        # every tenant's organization records.
+        if "super_admin" not in ident.roles:
+            own = _svc().by_tenant(s, ident.tenant_id)
+            return ok([_svc().out(own)] if own else [])
         return ok(_svc().list(s))
 
 
 @bp.get("/org/v1/organizations/<org_id>")
 @require_roles(*ADMIN)
 def get_org(org_id):
+    ident = current_identity()
     with _db().session() as s:
-        return ok(_svc().out(_svc().get(s, org_id)))
+        org = _svc().get(s, org_id)
+        if "super_admin" not in ident.roles and org.tenant_id != ident.tenant_id:
+            raise NotFound("Organization not found", code="org_not_found")
+        return ok(_svc().out(org))
 
 
 @bp.put("/org/v1/organizations/<org_id>")
 @require_roles(*ADMIN)
 def update_org(org_id):
     data = _parse(OrgUpdate, request.get_json(silent=True))
+    ident = current_identity()
     with _db().session() as s:
+        org = _svc().get(s, org_id)
+        if "super_admin" not in ident.roles and org.tenant_id != ident.tenant_id:
+            raise NotFound("Organization not found", code="org_not_found")
         return ok(_svc().out(_svc().update(s, org_id, data)))
 
 

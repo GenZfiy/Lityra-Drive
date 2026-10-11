@@ -177,15 +177,19 @@ class CandidateService:
         s.flush()
         return cand
 
-    def search(self, s: Session, q: str, limit: int = 10) -> list[dict]:
+    def search(self, s: Session, q: str, limit: int = 10,
+               candidate_ids: list[str] | None = None) -> list[dict]:
         from sqlalchemy import func
+        if candidate_ids is not None and not candidate_ids:
+            return []
         like = f"%{q.lower()}%"
-        rows = s.execute(
-            select(Candidate).where(
+        stmt = select(Candidate).where(
                 func.lower(Candidate.full_name).like(like)
                 | func.lower(Candidate.branch).like(like)
-            ).limit(limit)
-        ).scalars().all()
+            )
+        if candidate_ids is not None:
+            stmt = stmt.where(Candidate.user_id.in_(candidate_ids))
+        rows = s.execute(stmt.limit(limit)).scalars().all()
         return [{"type": "candidate", "id": c.user_id, "title": c.full_name or c.user_id,
                  "subtitle": c.branch or "", "status": c.college_id or ""} for c in rows]
 

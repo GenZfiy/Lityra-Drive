@@ -4,12 +4,25 @@ from pydantic import BaseModel, Field
 
 
 class DriveIn(BaseModel):
-    company_id: str
-    company_name: str = Field(min_length=1, max_length=255)
+    company_id: str | None = None
+    company_name: str | None = Field(default=None, max_length=255)
     title: str = Field(min_length=1, max_length=255)
     reporting_time: str | None = None
     venue: str | None = None
     contact_email: str | None = None  # company email — notifications reply here
+    drive_type: str = Field(default="company_off_campus", pattern="^(company_off_campus|college_hosted|college_adopted|company_hosted|joint|multi_college)$")
+    host_college_id: str | None = Field(default=None, max_length=64)
+    college_ids: list[str] = Field(default_factory=list, max_length=50)
+    company_ids: list[str] = Field(default_factory=list, max_length=50)
+    nomination_required: bool = False
+    company_confirmation_required: bool = False
+    college_approval_required: bool = False
+    host_confirmation_required: bool = False
+
+
+class ParticipationDecisionIn(BaseModel):
+    decision: str = Field(pattern="^(accept|decline|request_changes|withdraw)$")
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class SkillReq(BaseModel):

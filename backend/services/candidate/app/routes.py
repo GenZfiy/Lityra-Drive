@@ -4,7 +4,7 @@ from __future__ import annotations
 from flask import Blueprint, current_app, request
 from pydantic import ValidationError
 
-from lare_common.auth_context import current_identity, require_roles
+from lare_common.auth_context import current_identity, require_permission
 from lare_common.errors import BadRequest
 from lare_common.responses import created, ok
 from lare_common.service_client import ServiceClient
@@ -17,11 +17,12 @@ from .service import CandidateService
 
 bp = Blueprint("candidate", __name__)
 
-RECRUITER = ("super_admin", "company_admin", "recruiter")
+RECRUITER = ("drive.candidate.view",)
 
 # East-west clients: consented LMS->Drive projection + File service integration.
 _CLIENT = ServiceClient("drive-candidate")
 _FILES = FileClient("drive-candidate")
+_DRIVE = ServiceClient("drive-candidate")
 
 
 def _svc() -> CandidateService:
@@ -30,6 +31,19 @@ def _svc() -> CandidateService:
 
 def _db():
     return current_app.extensions["db"]
+
+
+def _visible_candidate_ids():
+    """Resolve the candidate set from the signed identity at the Drive owner."""
+    try:
+        response = _DRIVE.get(
+            "drive-core", "/drive/v1/assigned-candidates",
+            context_token=request.headers.get("X-Internal-Token") or None)
+        return set((response or {}).get("data") or [])
+    except Exception as exc:  # noqa: BLE001
+        current_app.logger.warning("candidate scope lookup failed: %s", exc)
+        from lare_common.errors import ServiceUnavailable
+        raise ServiceUnavailable("Could not verify candidate access") from exc
 
 
 def _parse(model, payload):
@@ -109,10 +123,13 @@ def parse_resume():
 
 
 @bp.post("/drive/v1/candidate/<cand_user_id>/rank")
-@require_roles(*RECRUITER)
+@require_permission(*RECRUITER)
 def rank_candidate(cand_user_id):
     """AI resume ranking (req #6): score a candidate against job requirements."""
     ident = current_identity()
+    if cand_user_id not in _visible_candidate_ids():
+        from lare_common.errors import NotFound
+        raise NotFound("Candidate not found", code="candidate_not_found")
     body = request.get_json(silent=True) or {}
     requirements = body.get("requirements") or {}
     with _db().session() as s:
@@ -126,11 +143,12 @@ def rank_candidate(cand_user_id):
 
 
 @bp.get("/drive/v1/candidates/search")
-@require_roles(*RECRUITER)
+@require_permission(*RECRUITER)
 def search_candidates():
     q = request.args.get("q", "").strip()
+    allowed = _visible_candidate_ids()
     with _db().session() as s:
-        return ok(_svc().search(s, q) if q else [])
+        return ok(_svc().search(s, q, candidate_ids=list(allowed)) if q else [])
 
 
 @bp.post("/drive/v1/candidate/photo")
@@ -171,10 +189,12 @@ def add_project():
 
 
 @bp.get("/drive/v1/candidates/resolve")
-@require_roles(*RECRUITER)
+@require_permission(*RECRUITER)
 def resolve_candidates():
     # Batch identity lookup for the recruiter UI (name/email/roll from user_ids).
     ids = [i for i in request.args.get("ids", "").split(",") if i]
+    allowed = _visible_candidate_ids()
+    ids = [candidate_id for candidate_id in ids if candidate_id in allowed]
     with _db().session() as s:
         return ok(_svc().resolve(s, ids))
 
@@ -240,8 +260,11 @@ def my_applications():
 
 # Recruiter-facing candidate view (scoped to applied drives in a later join).
 @bp.get("/drive/v1/candidates/<cid>")
-@require_roles(*RECRUITER)
+@require_permission(*RECRUITER)
 def recruiter_view(cid):
+    if cid not in _visible_candidate_ids():
+        from lare_common.errors import NotFound
+        raise NotFound("Candidate not found", code="candidate_not_found")
     with _db().session() as s:
         cand = _svc().get_by_id(s, cid)
         return ok(_svc().profile_out(s, cand))

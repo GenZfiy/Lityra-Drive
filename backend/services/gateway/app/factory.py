@@ -10,6 +10,7 @@ from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 
 from lare_common.errors import register_error_handlers
+from lare_common.internal import mint_gateway_context
 from lare_common.responses import error_payload
 from lare_common.security import decode_token
 
@@ -32,7 +33,15 @@ def build_app() -> Flask:
         raise RuntimeError("APP_PRODUCT must be learn, hire, or combined")
     app = Flask(cfg.SERVICE_NAME)
     app.config["LARE"] = cfg
-    CORS(app, origins=cfg.CORS_ORIGINS, supports_credentials=True)
+    CORS(
+        app,
+        origins=cfg.CORS_ORIGINS,
+        supports_credentials=True,
+        allow_headers=[
+            "Content-Type", "Authorization", "X-Access-Grant",
+            "X-Tunnel-Skip-AntiPhishing-Page",
+        ],
+    )
     register_error_handlers(app)
 
     router = Router(cfg)
@@ -83,6 +92,13 @@ def build_app() -> Flask:
         if upstream is None:
             return jsonify(error_payload("route_not_found", "Unknown route")), 404
 
+        # Browser CORS preflights do not include the access token sent by the
+        # subsequent request. Answer them here so protected endpoints such as
+        # /auth/v1/me are not rejected by the normal authentication check.
+        # Flask-CORS adds the configured allow-origin and allow-header values.
+        if request.method == "OPTIONS":
+            return "", 204
+
         # Rate limit (exam paths get a higher ceiling).
         limit = cfg.EXAM_RATE_LIMIT_PER_MIN if "/exam" in full else cfg.RATE_LIMIT_PER_MIN
 
@@ -118,6 +134,7 @@ def build_app() -> Flask:
 
             g.identity_claims = claims
             injected = {
+                "X-Internal-Token": mint_gateway_context(claims),
                 "X-User-Id": claims["sub"],
                 "X-Roles": ",".join(claims.get("roles", [])),
                 "X-Permissions": ",".join(claims.get("permissions", [])),

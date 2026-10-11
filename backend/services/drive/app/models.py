@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from lare_common.db import Base
@@ -36,9 +36,55 @@ class Drive(Base):
     schedule: Mapped[dict] = mapped_column(JSON, default=dict)
     created_by: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # Ownership and participation are separate from the recruiting company.
+    tenant_id: Mapped[str] = mapped_column(String(64), default="lare", index=True)
+    drive_type: Mapped[str] = mapped_column(String(32), default="company_off_campus")
+    organizer_type: Mapped[str] = mapped_column(String(16), default="company")
+    organizer_id: Mapped[str] = mapped_column(String(64), default="lare")
+    host_college_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    adoption_status: Mapped[str | None] = mapped_column(String(16))
+    workflow_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # A shared campus/joint event can contain one isolated pipeline drive per
+    # recruiting company. Every downstream workflow remains keyed by drive_id.
+    event_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    parent_drive_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    pipeline_company_id: Mapped[str | None] = mapped_column(String(64), index=True)
 
     roles: Mapped[list["DriveRole"]] = relationship(cascade="all, delete-orphan")
     rounds: Mapped[list["Round"]] = relationship(cascade="all, delete-orphan")
+    institutions: Mapped[list["DriveInstitutionParticipation"]] = relationship(cascade="all, delete-orphan")
+    companies: Mapped[list["DriveCompanyParticipation"]] = relationship(cascade="all, delete-orphan")
+
+
+class DriveInstitutionParticipation(Base):
+    """A college's explicit participation; it does not imply recruiter access."""
+    __tablename__ = "drive_institution_participation"
+    __table_args__ = (UniqueConstraint("drive_id", "college_id", name="uq_drive_college"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    drive_id: Mapped[str] = mapped_column(ForeignKey("drives.id", ondelete="CASCADE"), index=True)
+    college_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="invited")
+    nomination_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    attendance_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    invited_by: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class DriveCompanyParticipation(Base):
+    """A recruiting/adopting company attached to a college or joint drive."""
+    __tablename__ = "drive_company_participation"
+    __table_args__ = (UniqueConstraint("drive_id", "company_id", name="uq_drive_company"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    drive_id: Mapped[str] = mapped_column(ForeignKey("drives.id", ondelete="CASCADE"), index=True)
+    company_id: Mapped[str] = mapped_column(String(64), index=True)
+    participation_role: Mapped[str] = mapped_column(String(16), default="recruiter")
+    status: Mapped[str] = mapped_column(String(16), default="invited")
+    responsibilities: Mapped[dict] = mapped_column(JSON, default=dict)
+    invited_by: Mapped[str | None] = mapped_column(String(64))
+    pipeline_drive_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class DriveRole(Base):

@@ -16,7 +16,10 @@ from lare_common.db import Database  # noqa: E402
 def cmd_init_db():
     cfg = DriveConfig()
     import app.models  # noqa: F401
-    Database(cfg.DATABASE_URL, echo=cfg.SQL_ECHO, schema=cfg.DB_SCHEMA).create_all()
+    db = Database(cfg.DATABASE_URL, echo=cfg.SQL_ECHO, schema=cfg.DB_SCHEMA)
+    db.create_all()
+    from migrate_cols import migrate_existing_columns
+    migrate_existing_columns(db)
     print("[init-db] tables created successfully")
 
 

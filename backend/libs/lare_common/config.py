@@ -58,10 +58,10 @@ class BaseConfig:
     JWT_PUBLIC_KEY: str | None = _read_key("JWT_PUBLIC_KEY", "JWT_PUBLIC_KEY_FILE")
     JWT_ISSUER: str = os.getenv("JWT_ISSUER", "lare-auth")
     JWT_AUDIENCE: str = os.getenv("JWT_AUDIENCE", "lare-platform")
-    # 4h access token so a full exam/drive session never expires mid-use (a
-    # 15-min token forced a refresh every few minutes — one flaky refresh over a
-    # tunnel would bounce the student to login mid-exam). Refresh token = 7 days.
-    ACCESS_TOKEN_TTL_MIN: int = _int("ACCESS_TOKEN_TTL_MIN", 240)
+    # Hire uses short access tokens so role changes and account suspension stop
+    # propagating stale permissions promptly. Refresh tokens rotate separately.
+    # Override only after weighing revocation latency against session resilience.
+    ACCESS_TOKEN_TTL_MIN: int = _int("ACCESS_TOKEN_TTL_MIN", 15)
     REFRESH_TOKEN_TTL_DAYS: int = _int("REFRESH_TOKEN_TTL_DAYS", 7)
 
     # Passwords / lockout

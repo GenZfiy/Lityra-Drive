@@ -14,6 +14,7 @@ from functools import wraps
 from flask import current_app, g, request
 
 from .errors import Forbidden, Unauthorized
+from .internal import verify_internal_context
 from .security import decode_token
 
 
@@ -152,26 +153,35 @@ class Scope:
 
 
 def _from_headers() -> Identity | None:
-    uid = request.headers.get("X-User-Id")
-    if not uid:
+    raw_context = request.headers.get("X-Internal-Token", "")
+    if not raw_context:
         return None
-    roles = [r for r in (request.headers.get("X-Roles", "").split(",")) if r]
-    colleges = [c for c in (request.headers.get("X-College-Ids", "").split(",")) if c]
-    perms = [p for p in (request.headers.get("X-Permissions", "").split(",")) if p]
-    branches = [b for b in (request.headers.get("X-Branch-Ids", "").split(",")) if b]
-    cohorts = [c for c in (request.headers.get("X-Cohort-Ids", "").split(",")) if c]
-    return Identity(
-        user_id=uid,
-        roles=roles,
-        tenant_id=request.headers.get("X-Tenant-Id", "lare"),
-        college_ids=colleges,
-        permissions=perms,
-        scope_level=request.headers.get("X-Scope-Level", "self"),
-        branch_ids=branches,
-        cohort_ids=cohorts,
-        product=request.headers.get("X-Product") or None,
-    )
+    try:
+        trusted = verify_internal_context(raw_context)
+    except Exception as exc:  # noqa: BLE001
+        raise Unauthorized("Invalid internal identity context") from exc
 
+    if trusted.get("type") == "gateway_context":
+        return Identity(
+            user_id=trusted["sub"], roles=trusted.get("roles", []),
+            tenant_id=trusted.get("tenant_id", "lare"),
+            college_ids=trusted.get("college_ids", []),
+            permissions=trusted.get("permissions", []),
+            scope_level=trusted.get("scope_level", "self"),
+            branch_ids=trusted.get("branch_ids", []),
+            cohort_ids=trusted.get("cohort_ids", []),
+            product=trusted.get("product"),
+        )
+
+    # East-west services may exercise only the signed role/permission context
+    # minted by ServiceClient. Reject any attempt to change it in headers.
+    uid = request.headers.get("X-User-Id", "")
+    roles = [r for r in request.headers.get("X-Roles", "").split(",") if r]
+    if uid != trusted.get("user_id") or roles != trusted.get("roles", []):
+        raise Unauthorized("Internal identity headers do not match their signature")
+    return Identity(user_id=trusted["user_id"], roles=trusted.get("roles", []),
+                    permissions=trusted.get("permissions", []),
+                    product=trusted.get("product"))
 
 def _from_bearer() -> Identity | None:
     auth = request.headers.get("Authorization", "")

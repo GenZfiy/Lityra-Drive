@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
-  ArrowLeft, Briefcase, Users, SlidersHorizontal, Rocket,
+  ArrowLeft, Briefcase, Building2, Users, SlidersHorizontal, Rocket,
   Plus, Check, ChevronRight, Award, BarChart3, Trophy, MessagesSquare,
   ChevronUp, ChevronDown, Trash2, CheckCircle2, Search, Command, GitBranch,
   Gauge, Calendar, ShieldAlert, X, Compass, Target, Eye, ClipboardList, Star, Send, Scale,
@@ -11,6 +11,7 @@ import { Card, Badge, Button, Field, Input } from "../../components/ui/primitive
 import { Loading } from "../../components/ui/states.jsx";
 import { useAsync } from "../../hooks/useAsync.js";
 import { api, withFallback, sseStream } from "../../lib/api.js";
+import { useAuth } from "../../lib/auth.jsx";
 import ResultsTab from "./ResultsTab.jsx";
 import InterviewsTab from "./InterviewsTab.jsx";
 import RoundsTab from "./RoundsTab.jsx";
@@ -31,6 +32,7 @@ const TAB_DEFS = {
   evidence: { label: "Evidence", icon: FileSearch },
   decisions: { label: "Decisions", icon: Trophy },
   analytics: { label: "Analytics", icon: BarChart3 },
+  organization: { label: "Organization & participation", icon: Building2 },
   configure: { label: "Configure", icon: SlidersHorizontal },
 };
 
@@ -38,7 +40,7 @@ const TAB_DEFS = {
 // Hiring-Manager / Interviewer / Leadership are honest PERSPECTIVE LENSES over
 // the same real data — they reshape the operating surface, not permissions.
 const LENSES = {
-  recruiter: { label: "Recruiter", home: "command", tabs: ["command", "pipeline", "candidates", "interviews", "rounds", "evidence", "decisions", "analytics", "configure"] },
+  recruiter: { label: "Recruiter", home: "command", tabs: ["command", "pipeline", "candidates", "interviews", "rounds", "evidence", "decisions", "analytics", "organization", "configure"] },
   manager: { label: "Hiring Manager", home: "candidates", tabs: ["candidates", "evidence", "decisions", "analytics", "command"] },
   interviewer: { label: "Interviewer", home: "workspace", tabs: ["workspace", "candidates", "interviews"] },
   leadership: { label: "Leadership", home: "analytics", tabs: ["analytics", "command", "pipeline"] },
@@ -46,6 +48,7 @@ const LENSES = {
 
 export default function DriveConsole() {
   const { id } = useParams();
+  const { user } = useAuth();
   const detail = useAsync(() => withFallback(api.drive(id), {}), [id]);
   const [tab, setTab] = useState("command");
   const [drive, setDrive] = useState(null);
@@ -55,9 +58,13 @@ export default function DriveConsole() {
   if (detail.loading) return <Loading />;
   const d = drive || detail.data || {};
   const rounds = (d.rounds || []).length;
+  const collegeManager = (user?.roles || []).some((role) => ["tpo", "college_admin", "dean", "principal"].includes(role)) && !(user?.roles || []).some((role) => ["super_admin", "company_admin", "recruiter"].includes(role));
+  const mayManageLifecycle = user?.roles?.includes("super_admin") ||
+    (["company", "joint"].includes(d.organizer_type) && d.organizer_id === user?.tenant_id) ||
+    (d.organizer_type === "college" && (user?.college_ids || []).includes(d.organizer_id));
   const lensDef = LENSES[lens] || LENSES.recruiter;
-  const visibleTabs = lensDef.tabs;
-  const activeTab = visibleTabs.includes(tab) ? tab : lensDef.home;
+  const visibleTabs = collegeManager ? ["organization"] : lensDef.tabs;
+  const activeTab = visibleTabs.includes(tab) ? tab : (collegeManager ? "organization" : lensDef.home);
   const pickLens = (l) => { setLens(l); setTab(LENSES[l].home); };
   async function openDrive() {
     setDriveError("");
@@ -89,15 +96,15 @@ export default function DriveConsole() {
             </dl>
           </div>
           <div className="hire-console-controls flex items-center gap-3 shrink-0">
-            <label className="flex items-center gap-2 h-9 px-3 rounded-lg border border-slate-200 bg-surface text-[12.5px]" title="Reshape the console for a persona (a view lens, not a permission change)">
+            {!collegeManager && <label className="flex items-center gap-2 h-9 px-3 rounded-lg border border-slate-200 bg-surface text-[12.5px]" title="Reshape the console for a persona (a view lens, not a permission change)">
               <Eye size={14} className="text-slate-400" />
               <span className="text-slate-400">View as</span>
               <select value={lens} onChange={(e) => pickLens(e.target.value)} className="bg-transparent font-semibold text-ink-900 outline-none">
                 {Object.entries(LENSES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
               </select>
-            </label>
+            </label>}
             <Badge tone={d.status === "open" ? "teal" : "slate"}>{d.status || "draft"}</Badge>
-            {d.status !== "open" && (
+            {!collegeManager && mayManageLifecycle && d.status !== "open" && (
               <Button onClick={openDrive}>
                 <Rocket size={17} /> Open drive
               </Button>
@@ -129,9 +136,82 @@ export default function DriveConsole() {
       {activeTab === "evidence" && <EvidenceLedger id={id} />}
       {activeTab === "decisions" && <DecisionsView id={id} />}
       {activeTab === "analytics" && <AnalyticsTab id={id} />}
+      {activeTab === "organization" && <OrganizationView d={d} id={id} user={user} collegeManager={collegeManager} onChange={setDrive} />}
       {activeTab === "configure" && <ConfigureView d={d} id={id} onChange={setDrive} />}
     </div></main>
   );
+}
+
+function OrganizationView({ d, id, user, collegeManager, onChange }) {
+  const [collegeIds, setCollegeIds] = useState("");
+  const [companyIds, setCompanyIds] = useState("");
+  const [adopting, setAdopting] = useState(d.drive_type === "college_adopted");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const roles = user?.roles || [];
+  const permissions = user?.permissions || [];
+  const superAdmin = roles.includes("super_admin");
+  const collegeOwner = d.organizer_type === "college" && (user?.college_ids || []).includes(d.organizer_id);
+  const companyOwner = ["company", "joint"].includes(d.organizer_type) && user?.tenant_id === d.organizer_id;
+  const ownsLifecycle = superAdmin || collegeOwner || companyOwner;
+  const canManageLifecycle = ownsLifecycle && (permissions.includes("drive.drive.manage") || superAdmin);
+  const canApprove = superAdmin || (collegeOwner && permissions.includes("drive.approval.manage"));
+  const canInviteColleges = permissions.includes("drive.participation.manage") &&
+    ((collegeManager && ["tpo", "college_admin", "dean"].some((role) => roles.includes(role)) && d.organizer_type === "college") ||
+     (!collegeManager && (roles.includes("company_admin") || roles.includes("recruiter") || roles.includes("super_admin")) && d.organizer_type !== "college"));
+  const canInviteCompanies = permissions.includes("drive.participation.manage") && collegeManager && d.organizer_type === "college" && roles.some((role) => ["tpo", "college_admin", "dean"].includes(role));
+  const split = (value) => value.split(",").map((part) => part.trim()).filter(Boolean);
+  async function invite(kind) {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      if (kind === "college") await api.inviteDriveColleges(id, split(collegeIds));
+      else await api.inviteDriveCompanies(id, split(companyIds), adopting);
+      onChange(await api.drive(id)); setCollegeIds(""); setCompanyIds("");
+      setNotice("Invitation sent. The organization will be able to accept or decline it from its Hire workspace.");
+    } catch (e) { setError(e?.message || "Could not send the invitation."); }
+    finally { setBusy(false); }
+  }
+  async function transition(status) {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const result = await api.transitionDrive(id, status);
+      onChange({ ...d, status: result?.status || status });
+      setNotice(status === "published" && result?.status === "pending_review"
+        ? "Submitted for college approval."
+        : `Drive status changed to ${result?.status || status}.`);
+    } catch (e) { setError(e?.message || "Could not update the drive status."); }
+    finally { setBusy(false); }
+  }
+  const institutions = d.institutions || [];
+  const companies = (d.companies || []).filter((company) => company.role !== "organizer");
+  return <section className="space-y-5" aria-label="Drive organization and participation">
+    <header className="flex flex-wrap items-end justify-between gap-4"><div><span className="hire-ops-kicker">Drive structure</span><h2 className="font-display text-xl font-semibold text-ink-900">Ownership, hosting & participation</h2><p className="mt-1 text-sm text-slate-500">Each organization receives only the coordination or recruitment access assigned to its role.</p></div>
+      <div className="flex flex-wrap gap-2">
+        {d.status === "draft" && canManageLifecycle && <Button disabled={busy} onClick={() => transition("published")}>{busy ? "Saving…" : "Submit / publish drive"}</Button>}
+        {d.status === "pending_review" && canApprove && <Button disabled={busy} onClick={() => transition("published")}>{busy ? "Saving…" : "Approve & publish"}</Button>}
+        {d.status === "published" && canManageLifecycle && <Button disabled={busy} onClick={() => transition("open")}>{busy ? "Saving…" : "Open event"}</Button>}
+        {d.status === "open" && canManageLifecycle && <Button variant="secondary" disabled={busy} onClick={() => transition("closed")}>Close event</Button>}
+      </div>
+    </header>
+    <div className="grid gap-4 md:grid-cols-3">
+      <Card className="p-4"><span className="text-xs uppercase tracking-wide text-slate-500">Drive model</span><p className="mt-1 font-semibold capitalize text-ink-900">{(d.drive_type || "company_off_campus").replaceAll("_", " ")}</p></Card>
+      <Card className="p-4"><span className="text-xs uppercase tracking-wide text-slate-500">Organizer</span><p className="mt-1 font-semibold capitalize text-ink-900">{d.organizer_type || "company"}</p></Card>
+      <Card className="p-4"><span className="text-xs uppercase tracking-wide text-slate-500">Company adoption</span><p className="mt-1 font-semibold capitalize text-ink-900">{d.adoption_status || "Not applicable"}</p></Card>
+    </div>
+    {error && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">{error}</p>}
+    {notice && <p role="status" className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">{notice}</p>}
+    <div className="grid gap-5 lg:grid-cols-2">
+      <Card className="p-5"><h3 className="font-semibold text-ink-900">Participating colleges</h3><p className="mt-1 text-sm text-slate-500">College access is limited to event coordination and assigned student participation.</p>
+        <ul className="mt-4 space-y-2">{institutions.length ? institutions.map((item) => <li key={item.college_id} className="flex justify-between rounded-lg bg-slate-50 p-3 text-sm"><span>{item.college_id}{item.college_id === d.host_college_id ? " · Host" : ""}</span><Badge tone={item.status === "accepted" ? "teal" : "slate"}>{item.status}</Badge></li>) : <li className="py-3 text-sm text-slate-400">No colleges are involved in this drive.</li>}</ul>
+      </Card>
+      <Card className="p-5"><h3 className="font-semibold text-ink-900">Recruiting companies</h3><p className="mt-1 text-sm text-slate-500">One designated company controls the candidate pipeline; other partners can coordinate the event.</p>
+        <ul className="mt-4 space-y-2">{companies.length ? companies.map((item) => <li key={item.company_id} className="flex justify-between rounded-lg bg-slate-50 p-3 text-sm"><span>{item.company_id} · {item.role}</span><Badge tone={item.status === "accepted" ? "teal" : "slate"}>{item.status}</Badge></li>) : <li className="py-3 text-sm text-slate-400">No additional companies are involved.</li>}</ul>
+      </Card>
+    </div>
+    {canInviteColleges && <Card className="p-5"><h3 className="font-semibold text-ink-900">Invite colleges</h3><p className="mt-1 text-sm text-slate-500">Inviting colleges is optional. Each invited institution must accept before it can coordinate participants.</p><div className="mt-3 flex flex-wrap gap-3"><Input aria-label="College IDs to invite" value={collegeIds} onChange={(e) => setCollegeIds(e.target.value)} placeholder="College IDs, comma-separated" className="min-w-64 flex-1" /><Button disabled={busy || !split(collegeIds).length} onClick={() => invite("college")}>{busy ? "Sending…" : "Invite colleges"}</Button></div></Card>}
+    {canInviteCompanies && <Card className="p-5"><h3 className="font-semibold text-ink-900">Invite recruiting companies</h3><p className="mt-1 text-sm text-slate-500">Companies receive recruitment access only after accepting the invitation.</p><div className="mt-3 flex flex-wrap gap-3"><Input aria-label="Company tenant IDs to invite" value={companyIds} onChange={(e) => setCompanyIds(e.target.value)} placeholder="Company tenant IDs, comma-separated" className="min-w-64 flex-1" /><Button disabled={busy || !split(companyIds).length} onClick={() => invite("company")}>{busy ? "Sending…" : "Invite companies"}</Button></div><label className="mt-3 flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={adopting || d.drive_type === "college_adopted"} disabled={d.drive_type === "college_adopted"} onChange={(e) => setAdopting(e.target.checked)} /> Invite as a drive adopter</label></Card>}
+  </section>;
 }
 
 /* ---------- derivations from real data (no fabrication) ---------- */

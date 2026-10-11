@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import secrets
-from sqlalchemy import func, select
+from copy import deepcopy
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timedelta, timezone
 
-from lare_common.errors import BadRequest, Conflict, NotFound
+from lare_common.errors import BadRequest, Conflict, Forbidden, NotFound
 from lare_common.security import new_id
 from lare_common.service_client import ServiceClient
 
@@ -20,10 +21,13 @@ def _as_utc(dt: datetime) -> datetime:
 
 # East-west clients: Candidate has name/email/roll; Auth is the fallback for
 # name/email (e.g. staff accounts with no candidate record).
-_AUTH = ServiceClient("drive-core", default_roles=["company_admin"], timeout=5)
-_CAND = ServiceClient("drive-core", default_roles=["company_admin"], timeout=5)
+_AUTH = ServiceClient("drive-core", default_roles=["company_admin"],
+                      default_permissions=["auth.user.view"], timeout=5)
+_CAND = ServiceClient("drive-core", default_roles=["company_admin"],
+                      default_permissions=["drive.candidate.view"], timeout=5)
 # Reads the candidate's Hire skill profile (drive-exam performance) for matching.
-_EVAL = ServiceClient("drive-core", default_roles=["recruiter"], timeout=6)
+_EVAL = ServiceClient("drive-core", default_roles=["recruiter"],
+                      default_permissions=["drive.candidate.view"], timeout=6)
 
 
 def _resolve_names(candidate_ids: list[str]) -> dict[str, dict]:
@@ -61,21 +65,385 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 from .models import (
-    ApplicationForm, Drive, DriveAccessCode, DriveAccessSession, DriveRole,
+    ApplicationForm, Drive, DriveAccessCode, DriveAccessSession, DriveCompanyParticipation,
+    DriveInstitutionParticipation, DriveRole,
     EligibilityRule, FormSubmission, PpoConfig, Registration, Round, RoundScore,
-    SeatAllocation,
+    SeatAllocation, ApplicationForm,
 )
 
 
 class DriveService:
+    def can_access_drive(self, s: Session, drive: Drive, identity) -> bool:
+        if identity.has_role("super_admin"):
+            return True
+        same_tenant = drive.tenant_id == identity.tenant_id
+        if same_tenant and drive.organizer_type in {"company", "joint"} and drive.organizer_id == identity.tenant_id:
+            if identity.has_role("company_admin") or drive.created_by == identity.user_id:
+                return True
+        if identity.has_role("recruiter", "company_admin"):
+            associated = s.execute(select(DriveCompanyParticipation.id).where(
+                DriveCompanyParticipation.drive_id == drive.id,
+                DriveCompanyParticipation.company_id == identity.tenant_id,
+                DriveCompanyParticipation.status == "accepted")).first()
+            if associated is not None:
+                return True
+            if same_tenant and drive.created_by == identity.user_id:
+                return True
+        college_ids = set(identity.college_ids or [])
+        if same_tenant and drive.organizer_type == "college" and drive.organizer_id in college_ids:
+            return True
+        if drive.host_college_id and drive.host_college_id in college_ids:
+            accepted_host = s.execute(select(DriveInstitutionParticipation.id).where(
+                DriveInstitutionParticipation.drive_id == drive.id,
+                DriveInstitutionParticipation.college_id == drive.host_college_id,
+                DriveInstitutionParticipation.status == "accepted")).first()
+            if accepted_host is not None:
+                return True
+        if college_ids:
+            associated = s.execute(select(DriveInstitutionParticipation.id).where(
+                DriveInstitutionParticipation.drive_id == drive.id,
+                DriveInstitutionParticipation.college_id.in_(college_ids),
+                DriveInstitutionParticipation.status == "accepted")).first()
+            return associated is not None
+        return False
+
+    def accessible_drives(self, s: Session, identity, status: str | None, limit: int) -> list[Drive]:
+        stmt = select(Drive)
+        if status:
+            stmt = stmt.where(Drive.status == status)
+        if not identity.has_role("super_admin"):
+            scopes = [Drive.tenant_id == identity.tenant_id]
+            if identity.has_role("recruiter", "company_admin"):
+                company_drives = select(DriveCompanyParticipation.drive_id).where(
+                    DriveCompanyParticipation.company_id == identity.tenant_id,
+                    DriveCompanyParticipation.status == "accepted")
+                scopes.extend((Drive.id.in_(company_drives), Drive.created_by == identity.user_id))
+            if identity.college_ids:
+                college_drives = select(DriveInstitutionParticipation.drive_id).where(
+                    DriveInstitutionParticipation.college_id.in_(identity.college_ids),
+                    DriveInstitutionParticipation.status == "accepted")
+                scopes.extend((Drive.id.in_(college_drives), Drive.host_college_id.in_(identity.college_ids)))
+            stmt = stmt.where(or_(*scopes))
+        rows = s.execute(stmt.order_by(Drive.created_at.desc()).limit(min(limit, 500))).scalars().all()
+        return [drive for drive in rows if self.can_access_drive(s, drive, identity)]
+
+    def recruitment_access(self, s: Session, drive: Drive, identity) -> bool:
+        if identity.has_role("super_admin"):
+            return True
+        same_tenant = drive.tenant_id == identity.tenant_id
+        if same_tenant and drive.organizer_type in {"company", "joint"} and drive.organizer_id == identity.tenant_id:
+            return identity.has_role("company_admin") or drive.created_by == identity.user_id
+        partner = s.execute(select(DriveCompanyParticipation).where(
+            DriveCompanyParticipation.drive_id == drive.id,
+            DriveCompanyParticipation.company_id == identity.tenant_id,
+            DriveCompanyParticipation.status == "accepted")).scalar_one_or_none()
+        if not partner or not (partner.responsibilities or {}).get("recruitment", True):
+            return False
+        # Partner recruiters use their own cloned drive so candidate records,
+        # evaluations and hiring decisions never share a pipeline.
+        if partner.pipeline_drive_id:
+            return partner.pipeline_drive_id == drive.id
+        # Compatibility for drives accepted before per-company pipeline clones
+        # were introduced; their recruitment permission remains unchanged.
+        return bool((partner.responsibilities or {}).get("recruitment", True))
+
     # ---------- drives ----------
-    def create(self, s: Session, data, creator: str) -> Drive:
-        d = Drive(id=new_id(), company_id=data.company_id, company_name=data.company_name,
+    def create(self, s: Session, data, identity) -> Drive:
+        college_types = {"college_hosted", "college_adopted"}
+        joint_types = {"joint", "multi_college"}
+        if data.drive_type in college_types:
+            if not identity.has_role("tpo", "college_admin", "dean", "principal", "super_admin"):
+                raise BadRequest("A college placement role is required to create this drive", code="college_role_required")
+            if not identity.college_ids:
+                raise BadRequest("The account must be assigned to a college", code="college_scope_required")
+            organizer_type, organizer_id = "college", identity.college_ids[0]
+            if data.host_college_id and data.host_college_id not in identity.college_ids:
+                raise BadRequest("The host college must be in your assigned scope", code="college_scope_required")
+            host_college_id = data.host_college_id or organizer_id
+        elif data.drive_type in joint_types:
+            if not identity.has_role("company_admin", "super_admin"):
+                raise BadRequest("Only a company administrator can organize a joint drive", code="company_role_required")
+            if not identity.college_ids and not data.college_ids:
+                raise BadRequest("A joint drive must identify participating colleges", code="participants_required")
+            organizer_type, organizer_id = "joint", identity.tenant_id
+            host_college_id = data.host_college_id
+        else:
+            if not identity.has_role("recruiter", "company_admin", "super_admin"):
+                raise BadRequest("A company recruitment role is required to create this drive", code="company_role_required")
+            if data.drive_type == "company_hosted" and not data.host_college_id:
+                raise BadRequest("Choose a host college for a company-hosted drive", code="host_required")
+            organizer_type, organizer_id = "company", identity.tenant_id
+            host_college_id = data.host_college_id
+
+        if data.drive_type == "company_off_campus" and (data.college_ids or data.company_ids or data.host_college_id):
+            raise BadRequest("Off-campus company drives cannot include college participation", code="unexpected_college_participation")
+        if data.drive_type == "college_adopted" and len(set(data.company_ids)) != 1:
+            raise BadRequest("A college-adopted drive must name exactly one adopting company", code="adopter_required")
+        if data.drive_type == "company_off_campus" and (data.college_approval_required or data.company_confirmation_required or data.host_confirmation_required):
+            raise BadRequest("Company-only off-campus drives cannot require college or partner approvals", code="unexpected_approval")
+        config = {
+            "nomination_required": bool(data.nomination_required),
+            "company_confirmation_required": bool(data.company_confirmation_required or data.drive_type == "college_adopted"),
+            "college_approval_required": bool(data.college_approval_required or data.drive_type in college_types),
+            "host_confirmation_required": bool(data.host_confirmation_required or data.drive_type == "company_hosted"),
+            "student_application_mode": "nomination" if data.nomination_required else "direct",
+            "company_pipelines": bool(data.company_ids),
+        }
+        company_id = identity.tenant_id if organizer_type in {"company", "joint"} else (data.company_id or "pending")
+        company_name = data.company_name or "Recruiting company to be confirmed"
+        d = Drive(id=new_id(), company_id=company_id, company_name=company_name,
                   title=data.title, reporting_time=data.reporting_time, venue=data.venue,
-                  contact_email=data.contact_email, created_by=creator)
+                  contact_email=data.contact_email, created_by=identity.user_id,
+                  tenant_id=identity.tenant_id, drive_type=data.drive_type,
+                  organizer_type=organizer_type, organizer_id=organizer_id,
+                  host_college_id=host_college_id,
+                  adoption_status="pending" if data.drive_type == "college_adopted" else None,
+                  workflow_config=config)
         s.add(d)
         s.flush()
+        d.event_group_id = d.id
+        college_ids = list(dict.fromkeys(data.college_ids or []))
+        if data.drive_type in college_types and organizer_id not in college_ids:
+            college_ids.insert(0, organizer_id)
+        if host_college_id:
+            college_ids.append(host_college_id)
+        for college_id in dict.fromkeys(college_ids):
+            if organizer_type == "college" and college_id not in identity.college_ids:
+                raise BadRequest("You may only add colleges in your assigned scope", code="college_scope_required")
+            s.add(DriveInstitutionParticipation(
+                drive_id=d.id, college_id=college_id,
+                status="accepted" if organizer_type == "college" and college_id == organizer_id else "invited",
+                nomination_required=bool(data.nomination_required),
+                attendance_allowed=bool(host_college_id and college_id == host_college_id),
+                invited_by=identity.user_id))
+        if organizer_type == "college":
+            for company_id in dict.fromkeys(data.company_ids):
+                s.add(DriveCompanyParticipation(
+                    drive_id=d.id, company_id=company_id,
+                    participation_role="adopter" if data.drive_type == "college_adopted" else "recruiter",
+                    status="invited", responsibilities={"recruitment": True,
+                                                         "coordination": True},
+                    invited_by=identity.user_id))
+        if organizer_type in {"company", "joint"}:
+            s.add(DriveCompanyParticipation(
+                drive_id=d.id, company_id=identity.tenant_id,
+                participation_role="organizer", status="accepted",
+                responsibilities={"recruitment": True}, invited_by=identity.user_id))
+            for company_id in dict.fromkeys(data.company_ids):
+                if company_id == identity.tenant_id:
+                    continue
+                s.add(DriveCompanyParticipation(
+                    drive_id=d.id, company_id=company_id, participation_role="recruiter",
+                    status="invited", responsibilities={"recruitment": True, "coordination": True},
+                    invited_by=identity.user_id))
+        s.flush()
         return d
+
+    def organization_out(self, s: Session, drive: Drive) -> dict:
+        institutions = s.execute(select(DriveInstitutionParticipation).where(
+            DriveInstitutionParticipation.drive_id == drive.id)).scalars().all()
+        companies = s.execute(select(DriveCompanyParticipation).where(
+            DriveCompanyParticipation.drive_id == drive.id)).scalars().all()
+        return {
+            "drive_type": drive.drive_type, "organizer_type": drive.organizer_type,
+            "organizer_id": drive.organizer_id, "tenant_id": drive.tenant_id,
+            "host_college_id": drive.host_college_id,
+            "adoption_status": drive.adoption_status,
+            "event_group_id": drive.event_group_id or drive.id,
+            "parent_drive_id": drive.parent_drive_id,
+            "pipeline_company_id": drive.pipeline_company_id,
+            "workflow": drive.workflow_config or {},
+            "institutions": [{"college_id": x.college_id, "status": x.status,
+                              "nomination_required": x.nomination_required,
+                              "attendance_allowed": x.attendance_allowed} for x in institutions],
+            "companies": [{"company_id": x.company_id, "role": x.participation_role,
+                           "status": x.status, "responsibilities": x.responsibilities or {},
+                           "pipeline_drive_id": x.pipeline_drive_id}
+                          for x in companies],
+        }
+
+    def add_colleges(self, s: Session, drive: Drive, college_ids: list[str], actor_id: str) -> list[dict]:
+        added = []
+        existing = set(s.execute(select(DriveInstitutionParticipation.college_id).where(
+            DriveInstitutionParticipation.drive_id == drive.id)).scalars())
+        for college_id in dict.fromkeys(college_ids):
+            if college_id in existing:
+                continue
+            row = DriveInstitutionParticipation(
+                drive_id=drive.id, college_id=college_id, status="invited",
+                nomination_required=bool((drive.workflow_config or {}).get("nomination_required")),
+                attendance_allowed=college_id == drive.host_college_id, invited_by=actor_id)
+            s.add(row); added.append(row)
+        return [{"college_id": r.college_id, "status": r.status} for r in added]
+
+    def invite_companies(self, s: Session, drive: Drive, company_ids: list[str], actor_id: str,
+                         adopting: bool = False) -> list[dict]:
+        existing = set(s.execute(select(DriveCompanyParticipation.company_id).where(
+            DriveCompanyParticipation.drive_id == drive.id)).scalars())
+        current_companies = s.execute(select(DriveCompanyParticipation).where(
+            DriveCompanyParticipation.drive_id == drive.id,
+            DriveCompanyParticipation.status.in_(["invited", "accepted"]))).scalars().all()
+        if adopting and (drive.drive_type != "college_adopted" or len(set(company_ids)) != 1):
+            raise BadRequest("A college-adopted drive must have exactly one adopting company", code="adopter_required")
+        if adopting and any(row.participation_role == "adopter" for row in current_companies):
+            raise Conflict("This drive already has an adopting company", code="adopter_already_invited")
+        added = []
+        for company_id in dict.fromkeys(company_ids):
+            if company_id in existing:
+                continue
+            role = "adopter" if adopting else "recruiter"
+            row = DriveCompanyParticipation(
+                drive_id=drive.id, company_id=company_id, participation_role=role,
+                status="invited", responsibilities={"recruitment": True,
+                                                       "coordination": True}, invited_by=actor_id)
+            s.add(row); added.append(row)
+            if adopting and drive.adoption_status is None:
+                drive.adoption_status = "pending"
+        return [{"company_id": r.company_id, "role": r.participation_role, "status": r.status}
+                for r in added]
+
+    def _clone_company_pipeline(self, s: Session, parent: Drive,
+                                participation: DriveCompanyParticipation,
+                                actor_id: str) -> Drive:
+        if participation.pipeline_drive_id:
+            return self.get(s, participation.pipeline_drive_id)
+        company_id = participation.company_id
+        pipeline = Drive(
+            id=new_id(), company_id=company_id, company_name=company_id,
+            title=parent.title, status="draft", reporting_time=parent.reporting_time,
+            venue=parent.venue, contact_email=None, schedule=deepcopy(parent.schedule or {}),
+            created_by=actor_id, tenant_id=company_id,
+            drive_type="company_off_campus", organizer_type="company",
+            organizer_id=company_id, host_college_id=parent.host_college_id,
+            adoption_status="accepted" if participation.participation_role == "adopter" else None,
+            workflow_config={"company_pipeline": True,
+                             "parent_drive_id": parent.id,
+                             "event_group_id": parent.event_group_id or parent.id,
+                             "student_application_mode": (parent.workflow_config or {}).get(
+                                 "student_application_mode", "direct")},
+            event_group_id=parent.event_group_id or parent.id,
+            parent_drive_id=parent.id, pipeline_company_id=company_id,
+        )
+        s.add(pipeline)
+        s.flush()
+        s.add(DriveCompanyParticipation(
+            drive_id=pipeline.id, company_id=company_id,
+            participation_role="organizer", status="accepted",
+            responsibilities={"recruitment": True, "coordination": True},
+            invited_by=actor_id))
+        for role in s.execute(select(DriveRole).where(DriveRole.drive_id == parent.id)).scalars():
+            s.add(DriveRole(id=new_id(), drive_id=pipeline.id, title=role.title,
+                            ctc=role.ctc, positions=role.positions,
+                            description=role.description, skills=deepcopy(role.skills or [])))
+        for round_row in s.execute(select(Round).where(Round.drive_id == parent.id)).scalars():
+            s.add(Round(id=new_id(), drive_id=pipeline.id, order=round_row.order,
+                        type=round_row.type, label=round_row.label,
+                        optional=round_row.optional, config=deepcopy(round_row.config or {}),
+                        service_ref=round_row.service_ref))
+        for rule in s.execute(select(EligibilityRule).where(
+                EligibilityRule.drive_id == parent.id)).scalars():
+            s.add(EligibilityRule(id=new_id(), drive_id=pipeline.id,
+                                  rule=deepcopy(rule.rule or {})))
+        form = s.get(ApplicationForm, parent.id)
+        if form:
+            s.add(ApplicationForm(drive_id=pipeline.id, fields=deepcopy(form.fields or [])))
+        ppo = s.get(PpoConfig, parent.id)
+        if ppo:
+            s.add(PpoConfig(drive_id=pipeline.id,
+                            eligibility=deepcopy(ppo.eligibility or {}),
+                            stages=deepcopy(ppo.stages or []),
+                            conversion_criteria=deepcopy(ppo.conversion_criteria or {})))
+        for institution in s.execute(select(DriveInstitutionParticipation).where(
+                DriveInstitutionParticipation.drive_id == parent.id)).scalars():
+            s.add(DriveInstitutionParticipation(
+                drive_id=pipeline.id, college_id=institution.college_id,
+                status=institution.status,
+                nomination_required=institution.nomination_required,
+                attendance_allowed=institution.attendance_allowed,
+                invited_by=actor_id))
+        participation.pipeline_drive_id = pipeline.id
+        s.flush()
+        return pipeline
+
+    def set_participation(self, s: Session, drive_id: str, *, college_id: str | None = None,
+                          company_id: str | None = None, decision: str,
+                          actor_id: str | None = None) -> dict:
+        if college_id:
+            row = s.execute(select(DriveInstitutionParticipation).where(
+                DriveInstitutionParticipation.drive_id == drive_id,
+                DriveInstitutionParticipation.college_id == college_id)).scalar_one_or_none()
+            field = "college"
+        else:
+            row = s.execute(select(DriveCompanyParticipation).where(
+                DriveCompanyParticipation.drive_id == drive_id,
+                DriveCompanyParticipation.company_id == company_id)).scalar_one_or_none()
+            field = "company"
+        if not row:
+            raise NotFound("Drive invitation not found", code="invitation_not_found")
+        if decision == "accept": row.status = "accepted"
+        elif decision == "decline": row.status = "declined"
+        elif decision == "withdraw": row.status = "withdrawn"
+        elif decision == "request_changes": row.status = "changes_requested"
+        if field == "company" and row.participation_role == "adopter":
+            drive = s.get(Drive, drive_id)
+            drive.adoption_status = row.status
+        result = {"drive_id": drive_id, f"{field}_id": college_id or company_id,
+                  "status": row.status}
+        if field == "company" and decision == "accept":
+            drive = s.get(Drive, drive_id)
+            if company_id != drive.organizer_id:
+                pipeline = self._clone_company_pipeline(s, drive, row, actor_id or "system")
+                result["pipeline_drive_id"] = pipeline.id
+                result["pipeline_company_id"] = company_id
+        return result
+
+    def transition(self, s: Session, drive_id: str, target: str) -> Drive:
+        allowed = {
+            "draft": {"published", "pending_review", "cancelled"},
+            "pending_review": {"published", "draft", "cancelled"},
+            "published": {"open", "cancelled", "archived"},
+            "open": {"closed", "cancelled"},
+            "closed": {"completed", "open", "cancelled", "archived"},
+            "completed": {"archived"}, "cancelled": {"archived"},
+            "archived": set(),
+        }
+        drive = self.get(s, drive_id)
+        if drive.parent_drive_id and target in {"published", "open"}:
+            parent = self.get(s, drive.parent_drive_id)
+            if parent.status not in {"published", "open"}:
+                raise Conflict("The shared event must be approved and published before a company pipeline can open",
+                               code="parent_event_not_published")
+        if target == "open" and not drive.rounds:
+            raise Conflict("Add at least one round before opening", code="no_rounds")
+        config = drive.workflow_config or {}
+        if target == "published":
+            if drive.status == "draft" and config.get("college_approval_required"):
+                target = "pending_review"
+            if config.get("company_confirmation_required"):
+                if drive.drive_type == "college_adopted" and drive.adoption_status != "accepted":
+                    raise Conflict("The adopting company must accept before publication", code="adoption_pending")
+                accepted = s.execute(select(DriveCompanyParticipation).where(
+                    DriveCompanyParticipation.drive_id == drive.id,
+                    DriveCompanyParticipation.status == "accepted")).scalars().all()
+                accepted_recruiter = any(bool((row.responsibilities or {}).get("recruitment")) for row in accepted)
+                if not accepted_recruiter:
+                    raise Conflict("A recruiting company must accept before publication", code="company_confirmation_pending")
+            if config.get("host_confirmation_required") and drive.host_college_id:
+                host = s.execute(select(DriveInstitutionParticipation.id).where(
+                    DriveInstitutionParticipation.drive_id == drive.id,
+                    DriveInstitutionParticipation.college_id == drive.host_college_id,
+                    DriveInstitutionParticipation.status == "accepted")).first()
+                if not host:
+                    raise Conflict("The host college must accept before publication", code="host_confirmation_pending")
+        if target not in allowed.get(drive.status, set()):
+            raise Conflict(f"Cannot move a {drive.status} drive to {target}", code="invalid_drive_transition")
+        drive.status = target
+        if not drive.parent_drive_id and target in {"closed", "completed", "cancelled", "archived"}:
+            children = s.execute(select(Drive).where(Drive.parent_drive_id == drive.id)).scalars().all()
+            for child in children:
+                if child.status not in {"completed", "cancelled", "archived"}:
+                    child.status = target
+        return drive
 
     def get(self, s: Session, did: str) -> Drive:
         d = s.get(Drive, did)
@@ -83,17 +451,45 @@ class DriveService:
             raise NotFound("Drive not found", code="drive_not_found")
         return d
 
-    def list(self, s: Session, status: str | None, limit: int) -> list[Drive]:
+    def list(self, s: Session, status: str | None, limit: int, *,
+             creator_id: str | None = None,
+             company_ids: list[str] | None = None) -> list[Drive]:
         q = select(Drive)
         if status:
             q = q.where(Drive.status == status)
+        if creator_id is not None:
+            q = q.where(Drive.created_by == creator_id)
+        if company_ids is not None:
+            # An empty binding set must fail closed, not mean all companies.
+            q = q.where(Drive.company_id.in_(company_ids or []))
         return list(s.execute(q.limit(limit)).scalars().all())
+
+    def assigned_candidate_ids(self, s: Session, identity) -> list[str]:
+        """Candidate IDs from drives the caller can actually access."""
+        drive_ids = [drive.id for drive in self.accessible_drives(s, identity, None, 500)]
+        if not drive_ids:
+            return []
+        q = select(Registration.candidate_id).join(
+            Drive, Drive.id == Registration.drive_id
+        ).where(Drive.id.in_(drive_ids)).distinct()
+        return list(s.execute(q).scalars().all())
 
     def delete(self, s: Session, did: str) -> dict:
         """Delete a drive and all its data (roles, rounds, registrations, scores,
         forms, seats, PPO). FK ON DELETE CASCADE handles the dependents."""
         d = self.get(s, did)
         title = d.title
+        if d.parent_drive_id:
+            parent_participation = s.execute(select(DriveCompanyParticipation).where(
+                DriveCompanyParticipation.drive_id == d.parent_drive_id,
+                DriveCompanyParticipation.company_id == d.pipeline_company_id)).scalar_one_or_none()
+            if parent_participation and parent_participation.pipeline_drive_id == d.id:
+                parent_participation.pipeline_drive_id = None
+        else:
+            # A shared event owns the child pipeline lifecycle; deleting the
+            # event removes its linked company pipelines and their dependent data.
+            for child in s.execute(select(Drive).where(Drive.parent_drive_id == d.id)).scalars().all():
+                s.delete(child)
         s.delete(d)
         s.flush()
         return {"id": did, "title": title, "deleted": True}
@@ -102,8 +498,11 @@ class DriveService:
         d = self.get(s, did)
         if not d.rounds:
             raise Conflict("Add at least one round before opening", code="no_rounds")
-        d.status = "open"
-        return d
+        if d.status == "draft":
+            d = self.transition(s, did, "published")
+        if d.status != "published":
+            raise Conflict("Only a published drive can open", code="drive_not_published")
+        return self.transition(s, did, "open")
 
     # ---------- Skills-to-Opportunity match (Lityra Hire) ----------
     def _candidate_skill_map(self, candidate_id: str) -> dict[str, float]:
@@ -742,13 +1141,11 @@ class DriveService:
         return cfg
 
     # ---------- search (req #27) ----------
-    def search(self, s: Session, q: str, limit: int = 10) -> list[dict]:
-        like = f"%{q.lower()}%"
-        rows = s.execute(
-            select(Drive).where(
-                func.lower(Drive.title).like(like) | func.lower(Drive.company_name).like(like)
-            ).limit(limit)
-        ).scalars().all()
+    def search(self, s: Session, q: str, identity, limit: int = 10) -> list[dict]:
+        needle = q.lower()
+        rows = [drive for drive in self.accessible_drives(s, identity, None, 500)
+                if needle in (drive.title or "").lower() or
+                   needle in (drive.company_name or "").lower()][:limit]
         return [{"type": "drive", "id": d.id, "title": d.title,
                  "subtitle": d.company_name, "status": d.status} for d in rows]
 
@@ -891,7 +1288,10 @@ class DriveService:
     def out(d: Drive) -> dict:
         return {"id": d.id, "company_name": d.company_name, "title": d.title,
                 "status": d.status, "reporting_time": d.reporting_time, "venue": d.venue,
-                "contact_email": d.contact_email}
+                "contact_email": d.contact_email, "drive_type": d.drive_type,
+                "organizer_type": d.organizer_type,
+                "host_college_id": d.host_college_id,
+                "adoption_status": d.adoption_status}
 
     @staticmethod
     def role_out(r: DriveRole) -> dict:

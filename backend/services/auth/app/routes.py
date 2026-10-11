@@ -10,7 +10,7 @@ from lare_common.errors import BadRequest, NotFound, Unauthorized
 from lare_common.internal import verify_service_token
 from lare_common.responses import created, ok
 
-from .models import User
+from .models import Role, User, UserRole
 from .schemas import (
     AdminUserCreateIn, AssignRoleIn, EmailVerifyIn, LoginIn, OtpRequestIn,
     OtpVerifyIn, PasswordForgotIn, PasswordResetIn, RefreshIn, RegisterIn,
@@ -242,8 +242,11 @@ def me():
 @require_permission("auth.role.assign")
 def assign_role():
     data = _parse(AssignRoleIn, request.get_json(silent=True))
+    ident = current_identity()
     with _db().session() as s:
         _require_product_user(s, data.user_id)
+        _svc().authorize_role_grant(s, ident, data.user_id, data.role,
+                                    data.college_id, data.branch_id, data.cohort_id)
         _svc().assign_role(s, data.user_id, data.role, data.college_id,
                            data.branch_id, data.cohort_id)
     _audit("admin.role.assigned", "user", data.user_id, role=data.role,
@@ -255,8 +258,14 @@ def assign_role():
 @require_permission("auth.role.assign")
 def unassign_role():
     data = _parse(AssignRoleIn, request.get_json(silent=True))
+    ident = current_identity()
     with _db().session() as s:
         _require_product_user(s, data.user_id)
+        # Apply the same target, tenant, self-change, and scope protections to
+        # removals. A manager cannot edit an account outside their authority.
+        _svc().authorize_role_grant(s, ident, data.user_id, data.role,
+                                    data.college_id, data.branch_id, data.cohort_id,
+                                    granting=False)
         _svc().remove_role(s, data.user_id, data.role, data.college_id)
     _audit("admin.role.unassigned", "user", data.user_id, role=data.role,
            college_id=data.college_id)
@@ -333,8 +342,9 @@ def delete_role(role_id):
 
 
 @bp.get("/users")
-@require_roles("super_admin", "company_admin", "college_admin", "recruiter")
+@require_permission("auth.user.view", "auth.user.manage")
 def list_users():
+    ident = current_identity()
     # `ids=a,b,c` resolves a specific set (used by Drive to label candidates by
     # name/email instead of raw UUIDs); otherwise lists up to `limit`.
     ids = [i for i in (request.args.get("ids", "").split(",")) if i]
@@ -342,11 +352,59 @@ def list_users():
     with _db().session() as s:
         stmt = select(User)
         allowed_product = getattr(current_app.config["LARE"], "AUTH_ALLOWED_PRODUCT", "combined")
-        if allowed_product in ("learn", "hire"):
-            stmt = stmt.where(User.product == allowed_product)
+        product = allowed_product if allowed_product in ("learn", "hire") else ident.product
+        if product in ("learn", "hire"):
+            stmt = stmt.where(User.product == product)
+        if "super_admin" not in ident.roles:
+            stmt = stmt.where(User.tenant_id == ident.tenant_id)
+        if ident.scope_level != "platform" and "super_admin" not in ident.roles and "company_admin" not in ident.roles:
+            scope_users = select(UserRole.user_id).where(
+                UserRole.college_id.in_(ident.college_ids or []))
+            if ident.scope_level == "branch":
+                scope_users = scope_users.where(UserRole.branch_id.in_(ident.branch_ids or []))
+            stmt = stmt.where(User.id.in_(scope_users))
         stmt = stmt.where(User.id.in_(ids)) if ids else stmt.limit(limit)
         rows = s.execute(stmt).scalars().all()
         return ok([_svc().user_out(s, u) for u in rows], meta={"count": len(rows)})
+
+
+@bp.post("/internal/organization-users")
+def internal_organization_users():
+    """Resolve Hire staff recipients for organization-level domain events.
+
+    This deliberately lives outside the public user-list API. Only trusted
+    drive/notification services may call it, and it returns the minimum fields
+    needed to deliver an invitation. College membership comes from role grants;
+    company membership comes from the Hire tenant id.
+    """
+    try:
+        claims = verify_service_token(request.headers.get("X-Internal-Token", ""))
+    except Exception as exc:  # noqa: BLE001
+        raise Unauthorized("invalid internal token") from exc
+    if claims.get("svc") not in {"drive", "notification"} or "auth.user.view" not in claims.get("permissions", []):
+        raise Unauthorized("service is not allowed to resolve organization users")
+    body = request.get_json(silent=True) or {}
+    kind = body.get("kind")
+    organization_id = (body.get("organization_id") or "").strip()
+    if kind not in {"company", "college"} or not organization_id or len(organization_id) > 64:
+        raise BadRequest("A valid organization kind and id are required", code="invalid_organization")
+    allowed_product = getattr(current_app.config["LARE"], "AUTH_ALLOWED_PRODUCT", "combined")
+    product = "hire" if allowed_product == "hire" else body.get("product")
+    if product != "hire":
+        raise BadRequest("Organization invitation recipients must be Hire users", code="wrong_product")
+    with _db().session() as s:
+        stmt = select(User).where(User.product == "hire", User.status == "active")
+        staff_users = select(UserRole.user_id).join(Role, Role.id == UserRole.role_id).where(
+            Role.product == "hire", Role.name != "student")
+        if kind == "company":
+            stmt = stmt.where(User.tenant_id == organization_id)
+            staff_users = staff_users.where(UserRole.college_id.is_(None))
+        else:
+            staff_users = staff_users.where(UserRole.college_id == organization_id)
+        stmt = stmt.where(User.id.in_(staff_users))
+        users = s.execute(stmt.order_by(User.created_at.asc()).limit(500)).scalars().all()
+        return ok([{"id": user.id, "email": user.email, "full_name": user.full_name}
+                   for user in users if user.email])
 
 
 # ---- User administration (Super Admin portal) ----
@@ -354,9 +412,18 @@ def list_users():
 @require_permission("auth.user.manage")
 def admin_create_user():
     data = _parse(AdminUserCreateIn, request.get_json(silent=True))
+    ident = current_identity()
+    allowed_product = getattr(current_app.config["LARE"], "AUTH_ALLOWED_PRODUCT", "combined")
+    actor_product = allowed_product if allowed_product in ("learn", "hire") else ident.product
+    if actor_product in ("learn", "hire") and data.product != actor_product:
+        raise BadRequest("You cannot create users for another product", code="wrong_product")
+    if allowed_product in ("learn", "hire") and data.product != allowed_product:
+        raise BadRequest("This authentication service is for another product", code="wrong_product")
     with _db().session() as s:
         user = _svc().register(s, data.email, data.password, data.full_name, data.product)
         if data.role:
+            _svc().authorize_role_grant(s, ident, user.id, data.role,
+                                        data.college_id, data.branch_id, data.cohort_id)
             _svc().assign_role(s, user.id, data.role, data.college_id,
                                data.branch_id, data.cohort_id)
         s.flush()
@@ -369,6 +436,7 @@ def admin_create_user():
 @bp.get("/admin/users")
 @require_permission("auth.user.manage", "auth.user.view")
 def admin_list_users():
+    ident = current_identity()
     q = request.args.get("q") or None
     status = request.args.get("status") or None
     product = getattr(current_app.config["LARE"], "AUTH_ALLOWED_PRODUCT", "combined")
@@ -376,18 +444,25 @@ def admin_list_users():
         product = request.args.get("product") or None
     limit = min(int(request.args.get("limit", 100)), 500)
     with _db().session() as s:
-        rows = _svc().list_admin_users(s, q, status, product, limit)
+        colleges = None if ident.scope_level == "platform" or "super_admin" in ident.roles or "company_admin" in ident.roles else ident.college_ids
+        branches = ident.branch_ids if ident.scope_level == "branch" else None
+        rows = _svc().list_admin_users(s, q, status, product, limit,
+                                       college_ids=colleges, branch_ids=branches,
+                                       tenant_id=None if "super_admin" in ident.roles else ident.tenant_id)
         return ok([_svc().admin_user_out(s, u) for u in rows], meta={"count": len(rows)})
 
 
 @bp.get("/admin/users/<uid>")
 @require_permission("auth.user.manage", "auth.user.view")
 def admin_get_user(uid):
+    ident = current_identity()
     with _db().session() as s:
         u = s.get(User, uid)
         if not u:
             raise NotFound("User not found", code="user_not_found")
         _require_product_user(s, uid)
+        if not _svc().user_in_scope(s, ident, uid):
+            raise NotFound("User not found", code="user_not_found")
         return ok(_svc().admin_user_out(s, u))
 
 
@@ -398,6 +473,8 @@ def admin_set_status(uid):
     ident = current_identity()
     with _db().session() as s:
         _require_product_user(s, uid)
+        if not _svc().user_in_scope(s, ident, uid):
+            raise NotFound("User not found", code="user_not_found")
         u = _svc().set_user_status(s, uid, status, actor_id=ident.user_id)
         s.flush()
         out = _svc().admin_user_out(s, u)

@@ -23,7 +23,7 @@ Run the entire product locally without Docker from this project directory:
 python scripts/run_local.py --init-db
 ```
 
-Use `--init-db` on the first run against a new Hire database to create its service tables. For later runs, use `python scripts/run_local.py`. The launcher reads this project's `.env`, installs missing Python and frontend dependencies, starts the Hire backend services and Vite, and reports the app at `http://127.0.0.1:5175`. Keep the terminal open; press Ctrl+C to stop the services. Learn and Hire use overlapping backend ports, so run one product at a time on this machine.
+Use `--init-db` on the first run against a new Hire database to create its service tables. For later runs, use `python scripts/run_local.py`. The launcher reads this project's `.env`, installs missing Python and frontend dependencies, starts the Hire backend services and Vite, and reports the app at `http://127.0.0.1:5175`. Hire uses backend ports `18000`–`18031` by default (gateway `18000`); Learn keeps its `8000`–`8031` range, so both products can run at once in separate terminals. The launcher also points Hire's gateway, anticheat service, and Vite proxy to Hire's offset ports. Use `--port-offset 12000` to choose another backend range. Keep each terminal open; press Ctrl+C in a product's terminal to stop only that product.
 
 Use only the Hire database URL and credentials in this project's `.env`. Database initialization creates/updates tables and seeds built-in roles; inspect the target database before using `--init-db`. Production schema initialization should use a reviewed staging release and migration-owner credentials, never the web runtime credential.
 

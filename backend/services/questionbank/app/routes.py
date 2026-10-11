@@ -7,7 +7,7 @@ from __future__ import annotations
 from flask import Blueprint, current_app, request
 from pydantic import ValidationError
 
-from lare_common.auth_context import require_roles
+from lare_common.auth_context import require_permission
 from lare_common.errors import BadRequest
 from lare_common.responses import created, ok
 
@@ -16,7 +16,7 @@ from .service import QuestionBankService
 
 bp = Blueprint("questionbank", __name__)
 
-AUTHOR = ("super_admin", "company_admin", "trainer", "recruiter")
+AUTHOR = ("drive.question.manage",)
 
 
 def _svc() -> QuestionBankService:
@@ -41,7 +41,7 @@ def _identity():
 
 
 @bp.post("/drive/v1/questions/generate")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def generate():
     # Draft exam-ready questions with the configured AI provider. Returns drafts
     # for the recruiter to review/edit — nothing is persisted until they save.
@@ -50,7 +50,7 @@ def generate():
 
 
 @bp.post("/drive/v1/questions")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def create():
     ident = _identity()
     data = _parse(QuestionIn, request.get_json(silent=True))
@@ -60,7 +60,7 @@ def create():
 
 
 @bp.get("/drive/v1/questions")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def list_questions():
     with _db().session() as s:
         rows = _svc().list(
@@ -75,14 +75,14 @@ def list_questions():
 
 
 @bp.get("/drive/v1/questions/<qid>")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def get_question(qid):
     with _db().session() as s:
         return ok(_svc().out(_svc().get(s, qid), with_key=True))
 
 
 @bp.put("/drive/v1/questions/<qid>")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def edit_question(qid):
     data = _parse(QuestionEdit, request.get_json(silent=True))
     with _db().session() as s:
@@ -90,29 +90,29 @@ def edit_question(qid):
 
 
 @bp.post("/drive/v1/questions/<qid>/activate")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def activate(qid):
     with _db().session() as s:
         return ok(_svc().out(_svc().activate(s, qid), with_key=True))
 
 
 # Approval workflow (req #14): submit -> approve/reject -> publish.
-REVIEWER = ("super_admin", "company_admin")
+REVIEWER = ("drive.question.review",)
 
 
 @bp.post("/drive/v1/questions/<qid>/workflow/<action>")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def workflow(qid, action):
     ident = _identity()
     # Only reviewers may approve/reject; authors may submit/publish own drafts.
-    if action in ("approve", "reject") and not ident.has_role(*REVIEWER):
+    if action in ("approve", "reject") and not ident.has_permission(*REVIEWER):
         raise BadRequest("Reviewer role required", code="reviewer_required")
     with _db().session() as s:
         return ok(_svc().out(_svc().transition(s, qid, action, ident.user_id), with_key=True))
 
 
 @bp.post("/drive/v1/questions/meta")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def question_meta():
     # Topic metadata for a set of question IDs (internal — Cognitive Twin). No
     # stems or answer keys are returned.
@@ -122,7 +122,7 @@ def question_meta():
 
 
 @bp.get("/drive/v1/questions/search")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def search_questions():
     q = request.args.get("q", "").strip()
     with _db().session() as s:
@@ -130,7 +130,7 @@ def search_questions():
 
 
 @bp.post("/drive/v1/questions/import")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def import_questions():
     ident = _identity()
     body = request.get_json(silent=True) or {}
@@ -143,7 +143,7 @@ def import_questions():
 
 
 @bp.post("/drive/v1/questions/bulk")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def bulk():
     ident = _identity()
     data = _parse(BulkIn, request.get_json(silent=True))
@@ -152,7 +152,7 @@ def bulk():
 
 
 @bp.post("/drive/v1/blueprints")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def create_blueprint():
     data = _parse(BlueprintIn, request.get_json(silent=True))
     with _db().session() as s:
@@ -161,7 +161,7 @@ def create_blueprint():
 
 
 @bp.post("/drive/v1/blueprints/<bid>/generate-paper")
-@require_roles(*AUTHOR)
+@require_permission(*AUTHOR)
 def generate_paper(bid):
     with _db().session() as s:
         return ok(_svc().generate_paper(s, bid))

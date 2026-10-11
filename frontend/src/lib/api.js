@@ -11,7 +11,17 @@ const REFRESH_KEY = `lare_refresh${TOKEN_SUFFIX}`;
 // example https://lityra-api.onrender.com). Keeping /api as the default
 // preserves the Vite development proxy and same-origin deployments.
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+const usesDevTunnel = API_BASE.includes(".devtunnels.ms");
 export const apiUrl = (path) => `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+
+// Dev Tunnels can show an anti-phishing interstitial to browser API requests.
+// Send its bypass header only when this frontend is explicitly configured to
+// use a Dev Tunnel; normal local and production API requests stay unchanged.
+function apiHeaders(headers = {}) {
+  return usesDevTunnel
+    ? { "X-Tunnel-Skip-AntiPhishing-Page": "true", ...headers }
+    : headers;
+}
 
 export const tokens = {
   get access() {
@@ -61,7 +71,7 @@ async function refreshAccess() {
     try {
       const res = await fetch(apiUrl("/auth/v1/refresh"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ refresh_token: rt }),
       });
       if (res.ok) {
@@ -91,7 +101,7 @@ export function sseStream(path, onData) {
     try {
       const headers = { Accept: "text/event-stream" };
       if (tokens.access) headers.Authorization = `Bearer ${tokens.access}`;
-      const res = await fetch(apiUrl(path), { headers, signal: ctrl.signal });
+      const res = await fetch(apiUrl(path), { headers: apiHeaders(headers), signal: ctrl.signal });
       if (!res.ok || !res.body) return;
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -120,7 +130,7 @@ async function request(path, opts = {}) {
 
   const res = await fetch(apiUrl(path), {
     method,
-    headers,
+    headers: apiHeaders(headers),
     body: body ? JSON.stringify(body) : undefined,
     // Never let the browser reuse a cached response: these are per-user (the
     // cache key is the URL, not the token), so on a shared machine a cached
@@ -265,6 +275,12 @@ export const api = {
 
   // ---- Drive (recruiter/admin management) ----
   createDrive: (body) => request("/drive/v1/drives", { method: "POST", body }),
+  driveInvitations: () => request("/drive/v1/invitations"),
+  respondDriveInvitation: (driveId, kind, participantId, decision) =>
+    request(`/drive/v1/drives/${driveId}/participation/${kind}/${encodeURIComponent(participantId)}`, { method: "POST", body: { decision } }),
+  inviteDriveColleges: (driveId, college_ids) => request(`/drive/v1/drives/${driveId}/institutions/invite`, { method: "POST", body: { college_ids } }),
+  inviteDriveCompanies: (driveId, company_ids, adopting = false) => request(`/drive/v1/drives/${driveId}/companies/invite`, { method: "POST", body: { company_ids, adopting } }),
+  transitionDrive: (driveId, status) => request(`/drive/v1/drives/${driveId}/transition`, { method: "POST", body: { status } }),
   deleteDrive: (id) => request(`/drive/v1/drives/${id}`, { method: "DELETE" }),
   addRole: (id, body) => request(`/drive/v1/drives/${id}/roles`, { method: "POST", body }),
   setEligibility: (id, body) => request(`/drive/v1/drives/${id}/eligibility`, { method: "POST", body }),
@@ -474,6 +490,15 @@ export const api = {
   // ---- Analytics ----
   dashboard: (role) => request(`/analytics/v1/dashboard/${role}`),
   ranking: () => request("/analytics/v1/colleges/ranking"),
+  collegeReadiness: (collegeId) => request(`/analytics/v1/college/${encodeURIComponent(collegeId)}/readiness`),
+
+  // Hire organization administration. These are organization tenants, not LMS colleges.
+  organizations: () => request("/org/v1/organizations"),
+  organization: (id) => request(`/org/v1/organizations/${encodeURIComponent(id)}`),
+  myOrganization: () => request("/org/v1/me"),
+  createOrganization: (body) => request("/org/v1/organizations", { method: "POST", body }),
+  updateOrganization: (id, body) => request(`/org/v1/organizations/${encodeURIComponent(id)}`, { method: "PUT", body }),
+  deleteOrganization: (id) => request(`/org/v1/organizations/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // ---- Notifications ----
   inbox: () => request("/notify/v1/inbox"),
@@ -510,6 +535,10 @@ export const api = {
   adminUser: (id) => request(`/auth/v1/admin/users/${id}`),
   createUser: (body) => request("/auth/v1/admin/users", { method: "POST", body }),
   setUserStatus: (id, status) => request(`/auth/v1/admin/users/${id}/status`, { method: "POST", body: { status } }),
+  myInterviews: () => request("/drive/v1/interviews/mine"),
+  interviewDossier: (id) => request(`/drive/v1/interviews/${id}/dossier`),
+  rateInterview: (id, body) => request(`/drive/v1/interviews/${id}/rate`, { method: "POST", body }),
+  decideInterview: (id, body) => request(`/drive/v1/interviews/${id}/decision`, { method: "POST", body }),
 
   // ---- Student home (dashboard + year-wise roadmap) ----
   studentHome: () => request("/lms/v1/students/me/home"),
@@ -575,7 +604,7 @@ export const api = {
   completeUpload: (fileId) => request(`/files/v1/${fileId}/complete`, { method: "POST" }),
   // raw PUT of bytes to the pre-signed token URL
   uploadBytes: (token, bytes, mime) =>
-    fetch(apiUrl(`/files/v1/upload/${token}`), { method: "PUT", headers: { "Content-Type": mime }, body: bytes }),
+    fetch(apiUrl(`/files/v1/upload/${token}`), { method: "PUT", headers: apiHeaders({ "Content-Type": mime }), body: bytes }),
   setResume: (resume_file_id) => request("/drive/v1/candidate/resume", { method: "POST", body: { resume_file_id } }),
 };
 

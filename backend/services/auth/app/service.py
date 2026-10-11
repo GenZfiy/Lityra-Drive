@@ -56,7 +56,8 @@ class AuthService:
         rows = s.execute(
             select(Role.name)
             .join(UserRole, UserRole.role_id == Role.id)
-            .where(UserRole.user_id == user.id, Role.product == user.product)
+            .where(UserRole.user_id == user.id, Role.product == user.product,
+                   Role.is_active.is_(True))
         ).scalars().all()
         return sorted(set(rows))
 
@@ -81,7 +82,10 @@ class AuthService:
         widest = min((r.scope_level for r in roles),
                      key=lambda lv: self._SCOPE_ORDER.index(lv)
                      if lv in self._SCOPE_ORDER else len(self._SCOPE_ORDER))
-        return sorted(set(codes)), widest
+        # Permission rows are shared across the two product catalogs. Filter at
+        # token issuance as defense in depth against stale/cross-product grants.
+        return sorted({code for code in codes
+                       if _permission_product(code) in (None, user.product)}), widest
 
     def _college_ids(self, s: Session, user: User) -> list[str]:
         rows = s.execute(
@@ -98,7 +102,9 @@ class AuthService:
         empty binding set at platform level as unrestricted."""
         rows = s.execute(
             select(UserRole.college_id, UserRole.branch_id, UserRole.cohort_id)
-            .where(UserRole.user_id == user.id)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(UserRole.user_id == user.id, Role.product == user.product,
+                   Role.is_active.is_(True))
         ).all()
         colleges = sorted({r[0] for r in rows if r[0]})
         branches = sorted({r[1] for r in rows if r[1]})
@@ -274,6 +280,8 @@ class AuthService:
                                             Role.product == user.product)).scalar_one_or_none()
         if not role:
             raise Conflict("Unknown role", code="unknown_role")
+        if not role.is_active:
+            raise Conflict("Role is inactive", code="inactive_role")
         exists = s.execute(
             select(UserRole).where(
                 UserRole.user_id == user_id,
@@ -289,6 +297,70 @@ class AuthService:
             return
         s.add(UserRole(id=new_id(), user_id=user_id, role_id=role.id,
                        college_id=college_id, branch_id=branch_id, cohort_id=cohort_id))
+
+    def authorize_role_grant(self, s: Session, actor, user_id: str, role_name: str,
+                             college_id: str | None, branch_id: str | None = None,
+                             cohort_id: str | None = None, *, granting: bool = True) -> None:
+        """Validate a role grant against the acting user's current token authority.
+
+        This is deliberately separate from ``assign_role`` because registration
+        and trusted provisioning also assign their fixed, low-privilege defaults.
+        Administrative callers must use this check before mutating a grant.
+        """
+        target = s.get(User, user_id)
+        if not target:
+            raise NotFound("User not found", code="user_not_found")
+        if actor.user_id == user_id:
+            raise Forbidden("You cannot change your own role assignments")
+        if actor.product in ("learn", "hire") and target.product != actor.product:
+            raise NotFound("User not found", code="user_not_found")
+        if "super_admin" not in actor.roles and target.tenant_id != actor.tenant_id:
+            raise NotFound("User not found", code="user_not_found")
+
+        role = s.execute(select(Role).where(
+            Role.name == role_name, Role.product == target.product
+        )).scalar_one_or_none()
+        if not role:
+            raise Conflict("Unknown role", code="unknown_role")
+        if granting and not role.is_active:
+            raise Conflict("Role is inactive", code="inactive_role")
+
+        if role.scope_level == "platform" and any((college_id, branch_id, cohort_id)):
+            raise BadRequest("Platform roles cannot carry organization bindings", code="invalid_scope_binding")
+        if role.scope_level == "college" and (not college_id or branch_id or cohort_id):
+            raise BadRequest("College roles require only a college binding", code="invalid_scope_binding")
+        if role.scope_level == "branch" and (not college_id or not branch_id or cohort_id):
+            raise BadRequest("Branch roles require college and branch bindings", code="invalid_scope_binding")
+        if role.scope_level == "section" and (not college_id or not branch_id or not cohort_id):
+            raise BadRequest("Section roles require college, branch, and cohort bindings", code="invalid_scope_binding")
+        if role.scope_level == "self" and any((college_id, branch_id, cohort_id)):
+            raise BadRequest("Self-scoped roles cannot carry organization bindings", code="invalid_scope_binding")
+
+        if "super_admin" in actor.roles:
+            return
+        if role.name == "super_admin":
+            raise Forbidden("Only a super admin can grant the super admin role")
+        # A manager may delegate only permissions and scope they already hold.
+        if role.scope_level not in self._SCOPE_ORDER or actor.scope_level not in self._SCOPE_ORDER:
+            raise Forbidden("Unknown authorization scope")
+        if self._SCOPE_ORDER.index(role.scope_level) < self._SCOPE_ORDER.index(actor.scope_level):
+            raise Forbidden("You cannot grant a role with broader data scope")
+        actor_permissions = set(actor.permissions)
+        if granting and any(p.code not in actor_permissions for p in role.permissions):
+            raise Forbidden("You cannot grant permissions you do not hold")
+
+        if role.scope_level == "platform":
+            raise Forbidden("Only a super admin can grant platform-wide roles")
+        company_wide = "company_admin" in actor.roles and role.scope_level != "platform"
+        if role.scope_level in ("college", "branch", "section"):
+            if not college_id or (not company_wide and college_id not in actor.college_ids):
+                raise Forbidden("The requested organization is outside your scope")
+        if role.scope_level in ("branch", "section"):
+            if not branch_id or (not company_wide and branch_id not in actor.branch_ids):
+                raise Forbidden("The requested branch is outside your scope")
+        if role.scope_level == "section":
+            if not cohort_id or (not company_wide and cohort_id not in actor.cohort_ids):
+                raise Forbidden("The requested cohort is outside your scope")
 
     # ---------- OTP / password reset / email verification ----------
     def _issue_verification(self, s: Session, user: User, purpose: str,
@@ -443,7 +515,10 @@ class AuthService:
         return out
 
     def list_admin_users(self, s: Session, q: str | None, status: str | None,
-                         product: str | None, limit: int) -> list[User]:
+                         product: str | None, limit: int,
+                         *, college_ids: list[str] | None = None,
+                         branch_ids: list[str] | None = None,
+                         tenant_id: str | None = None) -> list[User]:
         stmt = select(User)
         if q:
             like = f"%{q.lower()}%"
@@ -453,8 +528,39 @@ class AuthService:
             stmt = stmt.where(User.status == status)
         if product:
             stmt = stmt.where(User.product == product)
+        if tenant_id is not None:
+            stmt = stmt.where(User.tenant_id == tenant_id)
+        if college_ids is not None:
+            scope = select(UserRole.user_id).where(UserRole.college_id.in_(college_ids or []))
+            if branch_ids is not None:
+                scope = scope.where(UserRole.branch_id.in_(branch_ids or []))
+            stmt = stmt.where(User.id.in_(scope))
         stmt = stmt.order_by(User.created_at.desc()).limit(limit)
         return list(s.execute(stmt).scalars().all())
+
+    def user_in_scope(self, s: Session, identity, user_id: str) -> bool:
+        user = s.get(User, user_id)
+        if not user:
+            return False
+        if identity.product in ("learn", "hire") and user.product != identity.product:
+            return False
+        if "super_admin" in identity.roles:
+            return True
+        if user.tenant_id != identity.tenant_id:
+            return False
+        if identity.has_role("company_admin") or identity.scope_level == "platform":
+            return True
+        if not identity.college_ids:
+            return False
+        scope = select(UserRole.user_id).where(
+            UserRole.user_id == user_id,
+            UserRole.college_id.in_(identity.college_ids),
+        )
+        if identity.scope_level == "branch":
+            if not identity.branch_ids:
+                return False
+            scope = scope.where(UserRole.branch_id.in_(identity.branch_ids))
+        return s.execute(scope).first() is not None
 
     def set_user_status(self, s: Session, user_id: str, status: str,
                         actor_id: str | None = None) -> User:

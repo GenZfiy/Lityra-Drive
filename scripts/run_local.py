@@ -22,6 +22,17 @@ PRODUCT = {"lms": "learn", "hire": "hire"}.get(PROJECT_NAME, PROJECT_NAME)
 FRONTEND_PORT = {"learn": 5174, "hire": 5175}.get(PRODUCT, 0)
 if not FRONTEND_PORT:
     raise RuntimeError("Place this script in a Lityra-learn or Lityra-hire project")
+DEFAULT_PORT_OFFSET = 10_000 if PRODUCT == "hire" else 0
+UPSTREAM_ENV = {
+    "auth": "AUTH_URL", "candidate": "CANDIDATE_URL", "drive": "DRIVE_URL",
+    "questionbank": "QUESTIONBANK_URL", "exam": "EXAM_URL", "submission": "SUBMISSION_URL",
+    "anticheat": "ANTICHEAT_URL", "coding": "CODING_URL", "evaluation": "EVALUATION_URL",
+    "interview": "INTERVIEW_URL", "result": "RESULT_URL", "notification": "NOTIFY_URL",
+    "files": "FILES_URL", "analytics": "ANALYTICS_URL", "audit": "AUDIT_URL",
+    "ai_orchestration": "AI_ORCH_URL", "organization": "ORG_URL", "evidence": "EVIDENCE_URL",
+    "competency": "COMPETENCY_URL", "decision": "DECISION_URL", "action": "ACTION_URL",
+    "recruit_ai": "RECRUIT_AI_URL",
+}
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -122,7 +133,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--init-db", action="store_true", help="Create/update this product's service tables before starting")
     parser.add_argument("--backend-only", action="store_true", help="Do not start the frontend dev server")
+    parser.add_argument("--port-offset", type=int, default=DEFAULT_PORT_OFFSET,
+                        help=f"Add this value to every backend registry port (default: {DEFAULT_PORT_OFFSET})")
     args = parser.parse_args()
+    if args.port_offset < 0:
+        raise RuntimeError("--port-offset must be zero or greater")
 
     env = os.environ.copy()
     env.update(read_env(PROJECT / ".env"))
@@ -133,7 +148,11 @@ def main() -> int:
     if not env.get("DATABASE_URL"):
         raise RuntimeError(f"Set DATABASE_URL in {PROJECT / '.env'} before starting this product")
 
-    services = load_services()
+    services = [(name, directory, port + args.port_offset) for name, directory, port in load_services()]
+    if any(port > 65535 for _, _, port in services):
+        raise RuntimeError("--port-offset produces a port above 65535")
+    service_ports = {name: port for name, _, port in services}
+    gateway_port = service_ports.get("gateway", 8000 + args.port_offset)
     ports = [port for _, _, port in services]
     if not args.backend_only:
         ports.append(FRONTEND_PORT)
@@ -166,7 +185,12 @@ def main() -> int:
             if name == "auth":
                 service_env["AUTH_ALLOWED_PRODUCT"] = PRODUCT
             if name == "gateway":
-                service_env.update(HOST="127.0.0.1", PORT="8000")
+                service_env.update(HOST="127.0.0.1", PORT=str(gateway_port))
+                for service_name, env_name in UPSTREAM_ENV.items():
+                    if service_name in service_ports:
+                        service_env[env_name] = f"http://127.0.0.1:{service_ports[service_name]}"
+            if name == "anticheat" and "exam" in service_ports:
+                service_env["EXAM_URL"] = f"http://127.0.0.1:{service_ports['exam']}"
             log = (run_dir / f"{name}.log").open("a", encoding="utf-8")
             proc = subprocess.Popen(
                 [str(python), "manage.py", "serve"],
@@ -186,13 +210,15 @@ def main() -> int:
                 print("Installing frontend dependencies (first run only)…", flush=True)
                 run([npm, "ci"], cwd=FRONTEND, env=env)
             log = (run_dir / "frontend.log").open("a", encoding="utf-8")
+            frontend_env = env.copy()
+            frontend_env["VITE_API_TARGET"] = f"http://127.0.0.1:{gateway_port}"
             proc = subprocess.Popen(
                 [npm, "run", "dev", "--", "--host", "127.0.0.1"],
-                cwd=FRONTEND, env=env, stdout=log, stderr=subprocess.STDOUT,
+                cwd=FRONTEND, env=frontend_env, stdout=log, stderr=subprocess.STDOUT,
             )
             processes.append(("frontend", proc, log))
 
-        gateway_url = "http://127.0.0.1:8000/health"
+        gateway_url = f"http://127.0.0.1:{gateway_port}/health"
         for _ in range(60):
             gateway = next((proc for name, proc, _ in processes if name == "gateway"), None)
             if gateway and gateway.poll() is not None:
@@ -206,7 +232,7 @@ def main() -> int:
         else:
             raise RuntimeError("Gateway did not become healthy; inspect backend/.run/gateway.log")
 
-        print(f"\n{PRODUCT.title()} API: http://127.0.0.1:8000/health", flush=True)
+        print(f"\n{PRODUCT.title()} API: {gateway_url}", flush=True)
         if not args.backend_only:
             print(f"{PRODUCT.title()} app: http://127.0.0.1:{FRONTEND_PORT}", flush=True)
         print("Keep this terminal open; press Ctrl+C to stop the product.", flush=True)

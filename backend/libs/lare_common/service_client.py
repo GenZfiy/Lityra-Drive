@@ -22,25 +22,34 @@ log = logging.getLogger("lare-svc-client")
 
 class ServiceClient:
     def __init__(self, caller: str, *, default_roles: list[str] | None = None,
+                 default_permissions: list[str] | None = None,
                  timeout: int = 5):
         self.caller = caller
         self.default_roles = default_roles or []
+        self.default_permissions = default_permissions or []
         self.timeout = timeout
 
-    def _headers(self, roles: list[str] | None, user_id: str | None) -> dict:
+    def _headers(self, roles: list[str] | None, user_id: str | None,
+                 permissions: list[str] | None,
+                 context_token: str | None = None) -> dict:
         roles = roles if roles is not None else self.default_roles
+        permissions = permissions if permissions is not None else self.default_permissions
         return {
             "Content-Type": "application/json",
-            "X-Internal-Token": mint_service_token(self.caller, roles=roles),
+            "X-Internal-Token": context_token or mint_service_token(
+                self.caller, roles=roles, user_id=user_id, permissions=permissions),
             "X-User-Id": user_id or f"svc-{self.caller}",
             "X-Roles": ",".join(roles),
         }
 
     def _request(self, method: str, url: str, payload: dict | None,
-                 roles: list[str] | None, user_id: str | None) -> dict | None:
+                 roles: list[str] | None, user_id: str | None,
+                 permissions: list[str] | None,
+                 context_token: str | None = None) -> dict | None:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(
-            url, data=data, method=method, headers=self._headers(roles, user_id)
+            url, data=data, method=method,
+            headers=self._headers(roles, user_id, permissions, context_token)
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
@@ -55,19 +64,25 @@ class ServiceClient:
 
     # path-based helpers (resolve service name -> base url) --------------------
     def post(self, service: str, path: str, payload: dict, *,
-             roles: list[str] | None = None, user_id: str | None = None) -> dict | None:
+             roles: list[str] | None = None, user_id: str | None = None,
+             permissions: list[str] | None = None,
+             context_token: str | None = None) -> dict | None:
         url = f"{service_url(service)}{path}"
-        return self._request("POST", url, payload, roles, user_id)
+        return self._request("POST", url, payload, roles, user_id, permissions, context_token)
 
     def get(self, service: str, path: str, *,
-            roles: list[str] | None = None, user_id: str | None = None) -> dict | None:
+            roles: list[str] | None = None, user_id: str | None = None,
+            permissions: list[str] | None = None,
+            context_token: str | None = None) -> dict | None:
         url = f"{service_url(service)}{path}"
-        return self._request("GET", url, None, roles, user_id)
+        return self._request("GET", url, None, roles, user_id, permissions, context_token)
 
     # absolute-url helper (used by the event bus fan-out) ---------------------
     def post_url(self, url: str, payload: dict, *,
-                 roles: list[str] | None = None, user_id: str | None = None) -> dict | None:
-        return self._request("POST", url, payload, roles, user_id)
+                 roles: list[str] | None = None, user_id: str | None = None,
+                 permissions: list[str] | None = None,
+                 context_token: str | None = None) -> dict | None:
+        return self._request("POST", url, payload, roles, user_id, permissions, context_token)
 
     def try_post(self, service: str, path: str, payload: dict, **kw) -> bool:
         """Fire-and-forget: swallow failures, return delivered?"""

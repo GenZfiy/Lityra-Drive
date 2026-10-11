@@ -68,7 +68,8 @@ def _secret() -> str:
 
 
 def mint_service_token(service_name: str, *, roles: list[str] | None = None,
-                       ttl_sec: int = 60) -> str:
+                       ttl_sec: int = 60, user_id: str | None = None,
+                       permissions: list[str] | None = None) -> str:
     """Sign a short-lived token identifying the calling service."""
     now = int(time.time())
     payload = {
@@ -76,8 +77,31 @@ def mint_service_token(service_name: str, *, roles: list[str] | None = None,
         "type": "service",
         "svc": service_name,
         "roles": roles or [],
+        "user_id": user_id or f"svc-{service_name}",
+        "permissions": permissions or [],
         "iat": now,
         "exp": now + ttl_sec,
+    }
+    return jwt.encode(payload, _secret(), algorithm="HS256")
+
+
+def mint_gateway_context(claims: dict, *, ttl_sec: int = 60) -> str:
+    """Sign the identity verified by the edge gateway for downstream services.
+
+    Services no longer trust unsigned X-User/X-Roles headers. The signed context
+    keeps their header-based request model while binding every authorization
+    claim to the gateway's validated access token.
+    """
+    now = int(time.time())
+    payload = {
+        "type": "gateway_context", "sub": claims["sub"],
+        "roles": claims.get("roles", []), "permissions": claims.get("permissions", []),
+        "tenant_id": claims.get("tenant_id", "lare"),
+        "college_ids": claims.get("college_ids", []),
+        "branch_ids": claims.get("branch_ids", []),
+        "cohort_ids": claims.get("cohort_ids", []),
+        "scope_level": claims.get("scope_level", "self"),
+        "product": claims.get("product"), "iat": now, "exp": now + ttl_sec,
     }
     return jwt.encode(payload, _secret(), algorithm="HS256")
 
@@ -87,4 +111,12 @@ def verify_service_token(token: str) -> dict:
     claims = jwt.decode(token, _secret(), algorithms=["HS256"])
     if claims.get("type") != "service":
         raise ValueError("not a service token")
+    return claims
+
+
+def verify_internal_context(token: str) -> dict:
+    """Verify a gateway-signed identity context or an east-west service token."""
+    claims = jwt.decode(token, _secret(), algorithms=["HS256"])
+    if claims.get("type") not in ("service", "gateway_context"):
+        raise ValueError("not a trusted internal identity context")
     return claims

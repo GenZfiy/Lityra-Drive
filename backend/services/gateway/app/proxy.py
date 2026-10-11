@@ -18,7 +18,7 @@ def forward(upstream_base: str, path: str, *, injected: dict, timeout: int) -> R
     # (those are stripped in the gateway before_request), then add injected ones.
     out_headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP and not k.lower().startswith("x-user")
+        if k.lower() not in HOP_BY_HOP and k.lower() != "x-internal-token" and not k.lower().startswith("x-user")
         and not k.lower().startswith("x-roles") and not k.lower().startswith("x-tenant")
         and not k.lower().startswith("x-college")
         # RBAC context — permissions & scope are derived from the verified token

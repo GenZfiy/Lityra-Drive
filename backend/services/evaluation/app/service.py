@@ -39,7 +39,8 @@ def _attempted(resp) -> bool:
 _CODE = ServiceClient("drive-evaluation", default_roles=["company_admin"], timeout=90)
 # East-west client to the Question Bank — resolves question IDs to topic tags for
 # the Cognitive Twin skill profile.
-_QB = ServiceClient("drive-evaluation", default_roles=["company_admin"], timeout=15)
+_QB = ServiceClient("drive-evaluation", default_roles=["company_admin"],
+                    default_permissions=["drive.question.manage"], timeout=15)
 
 
 def _mastery(correct: int, attempted: int) -> float:

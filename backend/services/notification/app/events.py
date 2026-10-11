@@ -3,7 +3,13 @@ into the recipient's inbox. Idempotent on the event id, so redelivery (Redis
 consumer redelivery or an HTTP retry) never duplicates."""
 from __future__ import annotations
 
+import os
+import logging
+
+from lare_common.service_client import ServiceClient
 from .service import SIGNATURE  # one shared company signature on every email
+
+log = logging.getLogger("lare-notify")
 
 
 class _Safe(dict):
@@ -25,6 +31,54 @@ TEMPLATES = {
 
 
 def register_handlers(bus, db, svc) -> None:
+    auth = ServiceClient("notification", default_roles=["super_admin"],
+                         default_permissions=["auth.user.view"], timeout=5)
+
+    def on_drive_invitation(payload, event):
+        """Deliver company/college drive invitations to active Hire staff."""
+        p = payload or {}
+        kind = p.get("kind")
+        if kind not in {"company", "college"}:
+            return
+        ids = [str(value) for value in p.get("participant_ids", []) if value]
+        if not ids:
+            return
+        title = p.get("drive_title") or "Placement drive"
+        organizer = p.get("organizer_name") or "A partner organization"
+        drive_id = str(p.get("drive_id") or "")
+        frontend = os.getenv("HIRE_FRONTEND_URL", "https://lityra-drive.netlify.app").rstrip("/")
+        url = f"{frontend}/drive/recruiter/drives" if frontend else ""
+        subject = f"Invitation to participate: {title}"
+        for organization_id in ids:
+            try:
+                resolved = auth.post("auth", "/auth/v1/internal/organization-users", {
+                    "kind": kind, "organization_id": organization_id, "product": "hire",
+                }) or {}
+                users = (resolved.get("data") or [])
+            except Exception:  # noqa: BLE001 — event delivery must not crash subscriber
+                log.exception("Could not resolve Hire invitation recipients for %s", organization_id)
+                continue
+            for user in users:
+                user_id = user.get("id")
+                email = user.get("email")
+                if not user_id:
+                    continue
+                body = (f"{organizer} invited your {kind} to participate in the {title} placement drive. "
+                        "Sign in to Lityra Hire to review and respond to the invitation.")
+                with db.session() as session:
+                    svc.notify_inapp(session, user_id=user_id,
+                                     template_key="drive.participant.invited",
+                                     subject=subject, body=body,
+                                     dedupe_key=f"{event.id}:{user_id}:inapp")
+                    if email:
+                        email_body = (f"Hello {user.get('full_name') or 'there'},\n\n{body}\n\n"
+                                      f"Review the invitation: {url}\n"
+                                      f"Drive reference: {drive_id}\n\n{SIGNATURE}")
+                        svc.notify_email(session, user_id=user_id, to=email,
+                                         template_key="drive.participant.invited",
+                                         subject=subject, body=email_body,
+                                         dedupe_key=f"{event.id}:{user_id}:email")
+
     def on_event(payload, event):
         tpl = TEMPLATES.get(event.type)
         if not tpl:
@@ -154,5 +208,6 @@ def register_handlers(bus, db, svc) -> None:
 
     for etype in TEMPLATES:
         bus.on(etype, on_event)
+    bus.on("drive.participant.invited", on_drive_invitation)
     bus.on("round.shortlisted", on_shortlisted)
     bus.on("coach.nudge", on_coach_nudge)

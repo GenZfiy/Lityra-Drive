@@ -13,8 +13,10 @@ import sys
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT.parent / ".env")
 REGISTRIES = {"hire": ROOT / "services.txt"}
 RELEASE_SCHEMA = "lityra_release"
 
@@ -88,6 +90,14 @@ def main() -> int:
                 env = os.environ.copy()
                 env["DATABASE_URL"] = url
                 env["APP_PRODUCT"] = args.product
+                # Service entry points import the shared package from backend/libs.
+                # They run with each service directory as cwd, so this path is not
+                # otherwise discoverable when release.py is launched from the repo.
+                shared_libs = str(ROOT / "libs")
+                inherited_pythonpath = env.get("PYTHONPATH")
+                env["PYTHONPATH"] = os.pathsep.join(
+                    part for part in (shared_libs, inherited_pythonpath) if part
+                )
                 for name, directory, port in parse_registry(args.product):
                     service_dir = ROOT / "services" / directory
                     if not (service_dir / "manage.py").is_file():

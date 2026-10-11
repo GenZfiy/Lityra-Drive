@@ -33,16 +33,22 @@ class AnalyticsService:
         s.flush()
         return {"ingested": len(facts)}
 
-    def _college_metric_avgs(self, s: Session, college_id: str) -> dict[str, float]:
-        rows = s.execute(
-            select(Fact.metric, func.avg(Fact.value))
-            .where(Fact.college_id == college_id)
-            .group_by(Fact.metric)
-        ).all()
+    def _scope_facts(self, stmt, identity):
+        if identity.scope_level == "branch":
+            # Facts have no branch_id; falling back to college would widen scope.
+            return stmt.where(False)
+        return identity.scope.apply(stmt, college_col=Fact.college_id,
+                                    cohort_col=Fact.cohort_id, user_col=Fact.learner_id)
+
+    def _college_metric_avgs(self, s: Session, college_id: str, identity=None) -> dict[str, float]:
+        stmt = select(Fact.metric, func.avg(Fact.value)).where(Fact.college_id == college_id)
+        if identity is not None:
+            stmt = self._scope_facts(stmt, identity)
+        rows = s.execute(stmt.group_by(Fact.metric)).all()
         return {m: round(float(v), 1) for m, v in rows}
 
-    def readiness(self, s: Session, college_id: str) -> dict:
-        avgs = self._college_metric_avgs(s, college_id)
+    def readiness(self, s: Session, college_id: str, identity=None) -> dict:
+        avgs = self._college_metric_avgs(s, college_id, identity)
         present = {m: w for m, w in READINESS_WEIGHTS.items() if m in avgs}
         total_w = sum(present.values())
         if total_w == 0:
@@ -65,12 +71,12 @@ class AnalyticsService:
                  "readiness_index": r["readiness_index"]}
                 for i, r in enumerate(results)]
 
-    def scorecard(self, s: Session, learner_id: str) -> dict:
-        rows = s.execute(
-            select(Fact.metric, func.avg(Fact.value))
-            .where(Fact.learner_id == learner_id, Fact.metric.in_(SCORECARD_DIMS))
-            .group_by(Fact.metric)
-        ).all()
+    def scorecard(self, s: Session, learner_id: str, identity=None) -> dict:
+        stmt = select(Fact.metric, func.avg(Fact.value)).where(
+            Fact.learner_id == learner_id, Fact.metric.in_(SCORECARD_DIMS))
+        if identity is not None:
+            stmt = self._scope_facts(stmt, identity)
+        rows = s.execute(stmt.group_by(Fact.metric)).all()
         card = {m: round(float(v), 1) for m, v in rows}
         return {"learner_id": learner_id,
                 "scorecard": {d: card.get(d, 0.0) for d in SCORECARD_DIMS}}
@@ -85,19 +91,24 @@ class AnalyticsService:
                    for m, cnt, avg, tot in rows}
         return {"drive_id": drive_id, "metrics": metrics}
 
-    def dashboard(self, s: Session, role: str) -> dict:
-        colleges = s.execute(
-            select(func.count(func.distinct(Fact.college_id)))
-        ).scalar_one()
-        learners = s.execute(
-            select(func.count(func.distinct(Fact.learner_id)))
-        ).scalar_one()
-        drives = s.execute(
-            select(func.count(func.distinct(Fact.drive_id)))
-        ).scalar_one()
+    def dashboard(self, s: Session, role: str, identity=None) -> dict:
+        stmt = select(Fact)
+        if identity is not None:
+            stmt = self._scope_facts(stmt, identity)
+        scoped = stmt.subquery()
+        colleges = s.execute(select(func.count(func.distinct(scoped.c.college_id)))).scalar_one()
+        learners = s.execute(select(func.count(func.distinct(scoped.c.learner_id)))).scalar_one()
+        drives = s.execute(select(func.count(func.distinct(scoped.c.drive_id)))).scalar_one()
+        college_stmt = select(scoped.c.college_id).where(scoped.c.college_id.is_not(None)).distinct()
+        visible_colleges = [cid for (cid,) in s.execute(college_stmt).all()]
+        ranking = [self.readiness(s, cid, identity) for cid in visible_colleges]
+        ranking.sort(key=lambda row: -row["readiness_index"])
         return {"role": role, "colleges": int(colleges or 0),
                 "learners": int(learners or 0), "drives": int(drives or 0),
-                "top_colleges": self.ranking(s)[:5]}
+                "top_colleges": ([{"rank": i + 1, "college_id": row["college_id"],
+                                   "readiness_index": row["readiness_index"]}
+                                  for i, row in enumerate(ranking[:5])]
+                                 if identity is None or identity.scope_level == "platform" else [])}
 
     def export_ranking_csv(self, s: Session) -> str:
         buf = io.StringIO()
